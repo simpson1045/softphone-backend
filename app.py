@@ -4,6 +4,7 @@ from twilio.twiml.voice_response import VoiceResponse
 from voicemails import voicemail_bp
 
 app = Flask(__name__)
+app.register_blueprint(voicemail_bp)
 
 #@app.route("/call/incoming", methods=["POST"])
 #def incoming_call():
