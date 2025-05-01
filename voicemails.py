@@ -1,11 +1,19 @@
-from flask import Blueprint, request, jsonify, Response, render_template_string
+from flask import Blueprint, request, jsonify, Response, render_template_string, send_file
 from twilio.twiml.voice_response import VoiceResponse
+from twilio.rest import Client
 import json
 import os
 from datetime import datetime
+import requests
+from io import BytesIO
 
 voicemail_bp = Blueprint("voicemail", __name__)
 VOICEMAIL_FILE = "voicemails.json"
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Ensure the voicemail file exists
 if not os.path.exists(VOICEMAIL_FILE):
@@ -47,13 +55,14 @@ def handle_incoming_call():
 @voicemail_bp.route("/voicemail/save", methods=["POST"])
 def save_voicemail():
     recording_url = request.form.get("RecordingUrl")
+    recording_sid = recording_url.split("/")[-1] if recording_url else ""
     from_number = request.form.get("From")
     transcription = request.form.get("TranscriptionText", "(no transcription)")
     timestamp = datetime.utcnow().isoformat()
 
     voicemail_entry = {
         "from": from_number,
-        "recording_url": recording_url,
+        "recording_sid": recording_sid,
         "transcription": transcription,
         "timestamp": timestamp
     }
@@ -80,7 +89,7 @@ def list_voicemails():
         <div style='margin-bottom:20px;'>
             <strong>From:</strong> {{ vm.from }}<br>
             <strong>Time:</strong> {{ vm.timestamp }}<br>
-            <strong>Recording:</strong> <a href="{{ vm.recording_url }}">Listen</a><br>
+            <strong>Recording:</strong> <audio controls><source src="/recording/{{ vm.recording_sid }}.mp3" type="audio/mpeg"></audio><br>
             <strong>Transcription:</strong> {{ vm.transcription }}<br>
         </div>
     {% endfor %}
@@ -88,3 +97,13 @@ def list_voicemails():
     </html>
     """
     return render_template_string(html, voicemails=data)
+
+@voicemail_bp.route("/recording/<sid>.mp3", methods=["GET"])
+def proxy_recording(sid):
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Recordings/{sid}.mp3"
+    response = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+
+    if response.status_code == 200:
+        return send_file(BytesIO(response.content), mimetype="audio/mpeg", download_name=f"{sid}.mp3")
+    else:
+        return f"Failed to retrieve recording (status {response.status_code})", 500
