@@ -6,6 +6,25 @@ from voicemails import voicemail_bp
 app = Flask(__name__)
 app.register_blueprint(voicemail_bp)
 
+# Token route
+@app.route("/token", methods=["GET"])
+def generate_token():
+    identity = request.args.get("identity", "softphone_user")
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    api_key = os.getenv("TWILIO_API_KEY")
+    api_secret = os.getenv("TWILIO_API_SECRET")
+    app_sid = os.getenv("TWILIO_APP_SID")
+
+    token = AccessToken(account_sid, api_key, api_secret, identity=identity)
+
+    voice_grant = VoiceGrant(outgoing_application_sid=app_sid)
+    token.add_grant(voice_grant)
+
+    return jsonify({
+        "identity": identity,
+        "token": token.to_jwt()
+    })
 #@app.route("/call/incoming", methods=["POST"])
 #def incoming_call():
  #   print("📞 /call/incoming was hit!", flush=True)
