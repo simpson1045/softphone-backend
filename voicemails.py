@@ -80,22 +80,57 @@ def list_voicemails():
     with open(VOICEMAIL_FILE, "r") as f:
         data = json.load(f)
 
-    html = """
-    <html>
-    <head><title>Voicemails</title></head>
-    <body>
-    <h1>Voicemail Log</h1>
+ html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Voicemail Log</title>
+    <link href="https://fonts.googleapis.com/css2?family=Audiowide&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Audiowide', cursive;
+            background: linear-gradient(135deg, #0b0c2a, #1b1c4d);
+            color: #ffffff;
+            padding: 40px;
+        }
+        h1 {
+            text-align: center;
+            font-size: 36px;
+            margin-bottom: 40px;
+            color: #00ffff;
+        }
+        .voicemail {
+            background-color: rgba(255, 255, 255, 0.05);
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            box-shadow: 0 0 15px rgba(0,255,255,0.3);
+        }
+        .voicemail audio {
+            width: 100%;
+            margin-top: 10px;
+        }
+        .label {
+            color: #00ffff;
+        }
+        .value {
+            color: #ffffff;
+        }
+    </style>
+</head>
+<body>
+    <h1>📡 Incoming Voicemails</h1>
     {% for vm in voicemails %}
-        <div style='margin-bottom:20px;'>
-            <strong>From:</strong> {{ vm.from }}<br>
-            <strong>Time:</strong> {{ vm.timestamp }}<br>
-            <strong>Recording:</strong> <audio controls><source src="/recording/{{ vm.recording_sid }}.mp3" type="audio/mpeg"></audio><br>
-            <strong>Transcription:</strong> {{ vm.transcription }}<br>
+        <div class="voicemail">
+            <div><span class="label">From:</span> <span class="value">{{ vm.from }}</span></div>
+            <div><span class="label">Time:</span> <span class="value">{{ vm.timestamp }}</span></div>
+            <div><span class="label">Recording:</span><br><audio controls><source src="/recording/{{ vm.recording_sid }}.mp3" type="audio/mpeg"></audio></div>
+            <div><span class="label">Transcription:</span> <span class="value">{{ vm.transcription }}</span></div>
         </div>
     {% endfor %}
-    </body>
-    </html>
-    """
+</body>
+</html>
+"""
     return render_template_string(html, voicemails=data)
 
 @voicemail_bp.route("/recording/<sid>.mp3", methods=["GET"])
