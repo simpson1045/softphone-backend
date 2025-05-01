@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from io import BytesIO
 import requests
+import pytz
 
 voicemail_bp = Blueprint("voicemail", __name__)
 VOICEMAIL_FILE = "voicemails.json"
@@ -54,10 +55,14 @@ def save_voicemail():
     recording_sid = recording_url.split("/")[-1] if recording_url else ""
     from_number = request.form.get("From")
     transcription = request.form.get("TranscriptionText", "(no transcription)")
-    timestamp_utc = datetime.utcnow()
-    timestamp_pst = timestamp_utc.astimezone().strftime('%Y-%m-%d %I:%M %p %Z')
 
-    # Download recording
+    # Convert timestamp to Pacific Time
+    utc = pytz.utc
+    pst = pytz.timezone("America/Los_Angeles")
+    timestamp_utc = datetime.utcnow().replace(tzinfo=utc)
+    timestamp_pst = timestamp_utc.astimezone(pst).strftime('%B %d, %Y — %I:%M %p %Z')
+
+    # Download recording locally
     local_filename = f"{RECORDINGS_DIR}/{recording_sid}.mp3"
     recording_response = requests.get(f"{recording_url}.mp3", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
     if recording_response.status_code == 200:
