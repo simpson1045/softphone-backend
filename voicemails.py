@@ -8,6 +8,12 @@ import requests
 from io import BytesIO
 from pytz import timezone, utc
 
+# SMB backup support
+from smbprotocol.connection import Connection
+from smbprotocol.session import Session
+from smbprotocol.tree import TreeConnect
+from smbprotocol.open import Open, CreateDisposition, FileAttributes, CreateOptions, FilePipePrinterAccessMask
+
 voicemail_bp = Blueprint("voicemail", __name__)
 VOICEMAIL_FILE = "voicemails.json"
 
@@ -21,13 +27,45 @@ if not os.path.exists(VOICEMAIL_FILE):
     with open(VOICEMAIL_FILE, "w") as f:
         json.dump([], f)
 
+def backup_voicemail_file():
+    server = "192.168.1.100"
+    share_name = "pc-reps"
+    filepath = "PC Reps/PC REPS OFFICE/voicemails.json"
+    username = "YOUR_WINDOWS_USERNAME"
+    password = "YOUR_PASSWORD"
+
+    conn = Connection(uuid="softphone-backup", server=server, port=445)
+    conn.connect()
+
+    session = Session(conn, username=username, password=password)
+    session.connect()
+
+    tree = TreeConnect(session, fr"\\{server}\{share_name}")
+    tree.connect()
+
+    with open("voicemails.json", "rb") as local_file:
+        file_data = local_file.read()
+
+    file = Open(tree, filepath,
+                access=FilePipePrinterAccessMask.GENERIC_WRITE,
+                disposition=CreateDisposition.FILE_OVERWRITE_IF,
+                options=CreateOptions.FILE_NON_DIRECTORY_FILE,
+                file_attributes=FileAttributes.FILE_ATTRIBUTE_NORMAL)
+    file.create()
+    file.write(file_data, 0)
+    file.close()
+
+    tree.disconnect()
+    session.disconnect()
+    conn.disconnect()
+
 @voicemail_bp.route("/call/incoming", methods=["POST"])
 def handle_incoming_call():
     print("📞 Incoming call handler hit!", flush=True)
 
     now = datetime.now()
     hour = now.hour
-    weekday = now.weekday()  # Monday = 0, Sunday = 6
+    weekday = now.weekday()
 
     resp = VoiceResponse()
 
@@ -45,9 +83,6 @@ def handle_incoming_call():
         transcribe_callback="/voicemail/save"
     )
     resp.hangup()
-
-    print("🔊 TwiML sent to Twilio:", flush=True)
-    print(str(resp), flush=True)
 
     return Response(str(resp), status=200, mimetype="text/xml")
 
@@ -72,6 +107,13 @@ def save_voicemail():
         f.seek(0)
         json.dump(data, f, indent=2)
 
+    # 🧠 Backup to Windows file share
+    try:
+        backup_voicemail_file()
+        print("✅ Voicemails backed up to file share", flush=True)
+    except Exception as e:
+        print(f"⚠️ Backup failed: {e}", flush=True)
+
     return ("", 204)
 
 @voicemail_bp.route("/voicemails", methods=["GET"])
@@ -83,8 +125,8 @@ def list_voicemails():
     for vm in data:
         utc_time = datetime.fromisoformat(vm["timestamp"])
         local_time = utc_time.replace(tzinfo=utc).astimezone(pacific)
-        vm["date"] = local_time.strftime("%B %d, %Y")  # May 01, 2025
-        vm["time"] = local_time.strftime("%I:%M %p %Z")  # 11:23 AM PDT
+        vm["date"] = local_time.strftime("%B %d, %Y")
+        vm["time"] = local_time.strftime("%I:%M %p %Z")
 
     html = """
     <!DOCTYPE html>
