@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 import requests
 from io import BytesIO
+from pytz import timezone, utc
 
 voicemail_bp = Blueprint("voicemail", __name__)
 VOICEMAIL_FILE = "voicemails.json"
@@ -31,11 +32,9 @@ def handle_incoming_call():
     resp = VoiceResponse()
 
     if 10 <= hour < 18 and 1 <= weekday <= 5:
-        # Open hours: Tuesday–Saturday, 10am–6pm
         resp.play("https://softphone-backend-host.onrender.com/open_greeting.mp3")
         resp.pause(length=1)
     else:
-        # Closed hours or Sunday/Monday
         resp.play("https://softphone-backend-host.onrender.com/closed_greeting.mp3")
 
     resp.record(
@@ -80,54 +79,62 @@ def list_voicemails():
     with open(VOICEMAIL_FILE, "r") as f:
         data = json.load(f)
 
+    pacific = timezone('US/Pacific')
+    for vm in data:
+        utc_time = datetime.fromisoformat(vm["timestamp"])
+        local_time = utc_time.replace(tzinfo=utc).astimezone(pacific)
+        vm["date"] = local_time.strftime("%B %d, %Y")  # May 01, 2025
+        vm["time"] = local_time.strftime("%I:%M %p %Z")  # 11:23 AM PDT
+
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-    <title>Voicemail Log</title>
-    <link href="https://fonts.googleapis.com/css2?family=Audiowide&display=swap" rel="stylesheet">
-    <style>
-        body {
-            font-family: 'Audiowide', cursive;
-            background: linear-gradient(135deg, #0b0c2a, #1b1c4d);
-            color: #ffffff;
-            padding: 40px;
-        }
-        h1 {
-            text-align: center;
-            font-size: 36px;
-            margin-bottom: 40px;
-            color: #00ffff;
-        }
-        .voicemail {
-            background-color: rgba(255, 255, 255, 0.05);
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 25px;
-            box-shadow: 0 0 15px rgba(0,255,255,0.3);
-        }
-        .voicemail audio {
-            width: 100%;
-            margin-top: 10px;
-        }
-        .label {
-            color: #00ffff;
-        }
-        .value {
-            color: #ffffff;
-        }
-    </style>
+        <title>Voicemail Log</title>
+        <link href="https://fonts.googleapis.com/css2?family=Audiowide&display=swap" rel="stylesheet">
+        <style>
+            body {
+                font-family: 'Audiowide', cursive;
+                background: linear-gradient(135deg, #0b0c2a, #1b1c4d);
+                color: #ffffff;
+                padding: 40px;
+            }
+            h1 {
+                text-align: center;
+                font-size: 36px;
+                margin-bottom: 40px;
+                color: #00ffff;
+            }
+            .voicemail {
+                background-color: rgba(255, 255, 255, 0.05);
+                padding: 20px;
+                border-radius: 10px;
+                margin-bottom: 25px;
+                box-shadow: 0 0 15px rgba(0,255,255,0.3);
+            }
+            .voicemail audio {
+                width: 100%;
+                margin-top: 10px;
+            }
+            .label {
+                color: #00ffff;
+            }
+            .value {
+                color: #ffffff;
+            }
+        </style>
     </head>
     <body>
-    <h1>📡 Incoming Voicemails</h1>
-    {% for vm in voicemails %}
-        <div class="voicemail">
-            <div><span class="label">From:</span> <span class="value">{{ vm.from }}</span></div>
-            <div><span class="label">Time:</span> <span class="value">{{ vm.timestamp }}</span></div>
-            <div><span class="label">Recording:</span><br><audio controls><source src="/recording/{{ vm.recording_sid }}.mp3" type="audio/mpeg"></audio></div>
-            <div><span class="label">Transcription:</span> <span class="value">{{ vm.transcription }}</span></div>
-        </div>
-    {% endfor %}
+        <h1>📡 Incoming Voicemails</h1>
+        {% for vm in voicemails %}
+            <div class="voicemail">
+                <div><span class="label">From:</span> <span class="value">{{ vm.from }}</span></div>
+                <div><span class="label">Date:</span> <span class="value">{{ vm.date }}</span></div>
+                <div><span class="label">Time:</span> <span class="value">{{ vm.time }}</span></div>
+                <div><span class="label">Recording:</span><br><audio controls><source src="/recording/{{ vm.recording_sid }}.mp3" type="audio/mpeg"></audio></div>
+                <div><span class="label">Transcription:</span> <span class="value">{{ vm.transcription }}</span></div>
+            </div>
+        {% endfor %}
     </body>
     </html>
     """
