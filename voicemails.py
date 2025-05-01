@@ -80,10 +80,10 @@ def list_voicemails():
     with open(VOICEMAIL_FILE, "r") as f:
         data = json.load(f)
 
- html = """
-<!DOCTYPE html>
-<html>
-<head>
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
     <title>Voicemail Log</title>
     <link href="https://fonts.googleapis.com/css2?family=Audiowide&display=swap" rel="stylesheet">
     <style>
@@ -117,8 +117,8 @@ def list_voicemails():
             color: #ffffff;
         }
     </style>
-</head>
-<body>
+    </head>
+    <body>
     <h1>📡 Incoming Voicemails</h1>
     {% for vm in voicemails %}
         <div class="voicemail">
@@ -128,9 +128,9 @@ def list_voicemails():
             <div><span class="label">Transcription:</span> <span class="value">{{ vm.transcription }}</span></div>
         </div>
     {% endfor %}
-</body>
-</html>
-"""
+    </body>
+    </html>
+    """
     return render_template_string(html, voicemails=data)
 
 @voicemail_bp.route("/recording/<sid>.mp3", methods=["GET"])
