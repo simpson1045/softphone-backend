@@ -31,8 +31,8 @@ def backup_voicemail_file():
     server = "192.168.1.100"
     share_name = "pc-reps"
     filepath = "PC Reps/PC REPS OFFICE/voicemails.json"
-    username = "YOUR_WINDOWS_USERNAME"
-    password = "YOUR_PASSWORD"
+    username = os.getenv("FILE_SHARE_USERNAME")
+    password = os.getenv("FILE_SHARE_PASSWORD")
 
     conn = Connection(uuid="softphone-backup", server=server, port=445)
     conn.connect()
