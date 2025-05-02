@@ -18,7 +18,7 @@ from smbprotocol.tree import TreeConnect
 from smbprotocol.open import Open, CreateOptions, FileAttributes, FilePipePrinterAccessMask, ShareAccess, CreateDisposition
 
 voicemail_bp = Blueprint("voicemail", __name__)
-VOICEMAIL_FILE = "voicemails.json"
+VOICEMAIL_FILE = r"\\192.168.1.100\pc-reps\PC Reps\softphone\voicemails\voicemails.json"
 RECORDINGS_DIR = "recordings"
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
