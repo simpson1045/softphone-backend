@@ -1,49 +1,2365 @@
-# test.py
-from flask import Flask, request, jsonify, Response
-from twilio.twiml.voice_response import VoiceResponse
+import os
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, send_from_directory, Response
+import requests
+from flask_cors import CORS
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
+from twilio.twiml.voice_response import VoiceResponse
+from flask_socketio import SocketIO
+from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.serving import WSGIRequestHandler
+from flask_login import current_user
+
+# Import blueprints
+from messaging import messaging_bp
+# messages_routes removed — all routes already exist in messaging.py (was causing duplicate registration)
+# from messages_routes import messages_api
+from import_contacts import import_contacts_bp
+from export_contacts import export_contacts_bp
+from incoming import incoming_bp
 from voicemails import voicemail_bp
-import os
+from address_book import address_book_bp
+from auth import auth_bp, init_login_manager
+from database import get_db_connection
+from call_recording import call_recording_bp
 
-app = Flask(__name__)
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "shared"))
+from scanner_blocker import scanner_blocker_bp
+
+FLASK_INSTANCE_ID = os.getpid()
+print(f"🚀 Flask instance {FLASK_INSTANCE_ID} starting...")
+
+load_dotenv()
+
+# Database is now PostgreSQL - see database.py
+
+# Flask app setup
+react_build_dir = os.path.join(
+    os.path.dirname(__file__), "..", "softphone-frontend", "dist"
+)
+app = Flask(__name__, static_folder=react_build_dir, static_url_path="/~build~")
+app.secret_key = os.getenv("FLASK_SECRET_KEY")
+if not app.secret_key:
+    raise RuntimeError("FLASK_SECRET_KEY environment variable is not set — add it to .env")
+CORS(app, origins=["https://softphone.pc-reps.com", "http://localhost:5173", "http://localhost:5000"])
+
+# Proxy fix for production - trust 1 proxy (Caddy)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# Disable default Flask request logging to use custom logging with real IPs
+log = logging.getLogger("werkzeug")
+log.setLevel(logging.ERROR)
+
+
+# Custom request logging that uses the real IP from ProxyFix
+@app.after_request
+def log_request(response):
+    # Suppress noisy routes
+    suppress_paths = [
+        "/voicemails/api",
+        "/voicemails/unread-count",
+        "/messages/threads",
+        "/messages/thread/",
+        "/messages/reactions/",
+        "/messages/pinned/",
+        "/api/calls",
+        "/messages/mark-read",
+        "/socket.io/",
+        "/api/settings/dnd",  # ADD THIS LINE
+    ]
+
+    # Skip logging if path matches suppression list
+    if not any(path in request.path for path in suppress_paths):
+        real_ip = request.remote_addr
+        timestamp = datetime.now().strftime("%d/%b/%Y %H:%M:%S")
+        print(
+            f'{real_ip} - - [{timestamp}] "{request.method} {request.full_path.rstrip("?")} HTTP/1.1" {response.status_code} -'
+        )
+
+    return response
+
+
+# Initialize SocketIO
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=["https://softphone.pc-reps.com", "http://localhost:5173", "http://localhost:5000"],
+    logger=False,
+    engineio_logger=False,
+    async_mode="threading",
+    ping_timeout=60,
+    ping_interval=25,
+)
+
+# Initialize Flask-Login
+init_login_manager(app)
+
+
+# Logging setup - suppress noisy routes
+class RouteFilter(logging.Filter):
+    def filter(self, record):
+        suppress_paths = [
+            "/voicemails/api",
+            "/voicemails/unread-count",
+            "/messages/threads",
+            "/messages/thread/",
+            "/messages/reactions/",
+            "/messages/pinned/",
+            "/api/calls",
+            "/messages/mark-read",
+            "/socket.io/",
+        ]
+        return not any(path in record.getMessage() for path in suppress_paths)
+
+
+logging.getLogger("werkzeug").addFilter(RouteFilter())
+
+# Register blueprints
+app.register_blueprint(incoming_bp)
 app.register_blueprint(voicemail_bp)
+app.register_blueprint(address_book_bp)
+app.register_blueprint(scanner_blocker_bp)
+app.register_blueprint(auth_bp)
+app.register_blueprint(messaging_bp)
+# app.register_blueprint(messages_api)  # Removed — duplicate of routes in messaging_bp
+app.register_blueprint(import_contacts_bp)
+app.register_blueprint(export_contacts_bp)
+app.register_blueprint(call_recording_bp)
 
-# Token route
-@app.route("/token", methods=["GET"])
-def generate_token():
-    identity = request.args.get("identity", "softphone_user")
+
+# ─── SEC-5: Global authentication enforcement ───
+# Protects all API routes. SPA/static routes are unprotected (React handles its own auth).
+# Twilio webhooks are whitelisted since they're called by Twilio servers (no browser session).
+
+# API paths that REQUIRE authentication
+PROTECTED_API_PREFIXES = (
+    "/api/",              # All /api/* endpoints (calls, settings, greetings, analytics, etc.)
+    "/voice/",            # Twilio token endpoint
+    "/messages/",         # Messaging routes (threads, send, mark-read, search, etc.)
+    "/address-book/",     # Contacts CRUD
+    "/voicemails/",       # Voicemail list, mark-read, stats
+    "/media-proxy",       # Media proxy
+    "/contacts/",         # Contact search, flags
+    "/flag-types",        # Flag management
+    "/thread/",           # Thread redirect
+    "/test-",             # Test endpoints
+)
+
+# Paths that look like API routes but must stay public (Twilio webhooks, auth)
+PUBLIC_EXCEPTIONS = (
+    "/api/auth/login",
+    "/api/auth/check",
+    "/api/external/send-sms",       # Has its own API key validation
+    "/messages/incoming",           # Twilio SMS webhook
+    "/messages/status",             # Twilio SMS status callback
+    "/messages/test",               # SMS test endpoint
+)
+
+@app.before_request
+def require_authentication():
+    """Enforce login on API routes, let SPA/static/webhooks through"""
+    path = request.path
+
+    # Allow CORS preflight
+    if request.method == "OPTIONS":
+        return None
+
+    # Check if this is a protected API path
+    if any(path.startswith(prefix) for prefix in PROTECTED_API_PREFIXES):
+        # Allow public exceptions (Twilio webhooks, login)
+        if any(path.startswith(exc) for exc in PUBLIC_EXCEPTIONS):
+            return None
+
+        # Require authentication for everything else
+        if not current_user.is_authenticated:
+            return jsonify({"error": "Authentication required"}), 401
+
+    # Non-API paths (SPA routes, static files, Twilio voice webhooks) pass through
+    return None
+
+
+@app.route("/voice/token")
+def voice_token():
+    # Require authentication
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Not authenticated"}), 401
 
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     api_key = os.getenv("TWILIO_API_KEY")
     api_secret = os.getenv("TWILIO_API_SECRET")
-    app_sid = os.getenv("TWILIO_APP_SID")
+    app_sid = os.getenv("TWIML_APP_SID")
 
+    if not all([account_sid, api_key, api_secret, app_sid]):
+        return "Missing Twilio environment variables", 500
+
+    # Use employee_id as unique Twilio identity
+    identity = current_user.employee_id
+
+    voice_grant = VoiceGrant(outgoing_application_sid=app_sid, incoming_allow=True)
     token = AccessToken(account_sid, api_key, api_secret, identity=identity)
-
-    voice_grant = VoiceGrant(outgoing_application_sid=app_sid)
     token.add_grant(voice_grant)
 
-    return jsonify({
-        "identity": identity,
-        "token": token.to_jwt()
-    })
-#@app.route("/call/incoming", methods=["POST"])
-#def incoming_call():
- #   print("📞 /call/incoming was hit!", flush=True)
-#
-   # resp = VoiceResponse()
-  #  resp.say("This is your test server. Twilio is connected.", voice="alice")
- #   resp.hangup()
-#
-  #  print("🔊 TwiML returned to Twilio:", flush=True)
- #   print(str(resp), flush=True)
-#
-   # return Response(str(resp), mimetype="text/xml")
+    print(f"🎫 Generated Twilio token for identity: {identity}")
+    return jsonify({"token": str(token.to_jwt())})
 
-@app.route("/", methods=["GET"])
-def health_check():
-    return "✅ Flask test server is live", 200
+
+@app.route("/call/flow", methods=["POST"])
+def call_flow():
+    response = VoiceResponse()
+    to_number = request.values.get("To")
+    caller_id = os.getenv("TWILIO_CALLER_ID", "+17754602190")
+
+    if not to_number:
+        return "Missing 'To' number", 400
+
+    # Dial with recording enabled
+    # The 'url' parameter plays TwiML to the callee when they answer (before connecting)
+    dial = response.dial(
+        caller_id=caller_id,
+        record="record-from-answer-dual",
+        recording_status_callback="https://softphone.pc-reps.com/recording/call-complete",
+        recording_status_callback_method="POST",
+        recording_status_callback_event="completed",
+    )
+    dial.number(to_number, url="https://softphone.pc-reps.com/outbound-notice")
+    return Response(str(response), mimetype="application/xml")
+
+
+@app.route("/outbound-notice", methods=["POST"])
+def outbound_notice():
+    """Plays recording notice to the callee when they answer an outbound call"""
+    response = VoiceResponse()
+    response.play("https://softphone.pc-reps.com/static/recording_notice.mp3")
+    return Response(str(response), mimetype="application/xml")
+
+
+@app.route("/api/call/transfer", methods=["POST"])
+def transfer_call():
+    """Transfer an active call to another agent.
+
+    Accepts: { call_sid, target_identity, is_incoming }
+    - call_sid: The CallSid from the browser's connection
+    - target_identity: The employee_id of the target agent (Twilio client identity)
+    - is_incoming: Whether this is an inbound call being transferred
+    """
+    from twilio.rest import Client as TwilioClient
+
+    if not current_user.is_authenticated:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Missing request body"}), 400
+
+    call_sid = data.get("call_sid")
+    target_identity = data.get("target_identity")
+    is_incoming = data.get("is_incoming", True)
+
+    if not call_sid or not target_identity:
+        return jsonify({"error": "call_sid and target_identity are required"}), 400
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    base_url = os.getenv("BASE_URL", "https://softphone.pc-reps.com")
+
+    if not all([account_sid, auth_token]):
+        return jsonify({"error": "Missing Twilio credentials"}), 500
+
+    try:
+        client = TwilioClient(account_sid, auth_token)
+        transfer_url = f"{base_url}/call/transfer-twiml?target={target_identity}"
+
+        if is_incoming:
+            # INCOMING CALL: Browser has the child call SID.
+            # Look up the parent call SID (the external caller's leg) via Twilio API.
+            child_call = client.calls(call_sid).fetch()
+            parent_call_sid = child_call.parent_call_sid
+
+            if not parent_call_sid:
+                return jsonify({"error": "Could not find parent call for transfer"}), 400
+
+            # Update the parent call with new TwiML that dials the target agent.
+            # This disconnects the current agent and rings the target agent.
+            client.calls(parent_call_sid).update(url=transfer_url, method="POST")
+
+            print(f"🔄 Transfer (incoming): child={call_sid} → parent={parent_call_sid} → target={target_identity}")
+
+        else:
+            # OUTBOUND CALL: Browser has the parent call SID.
+            # Find the child call (the external party's leg).
+            child_calls = client.calls.list(parent_call_sid=call_sid, status="in-progress", limit=1)
+
+            if not child_calls:
+                return jsonify({"error": "Could not find active child call for transfer"}), 400
+
+            child_call_sid = child_calls[0].sid
+
+            # Update the child call with new TwiML that dials the target agent.
+            # The parent (browser) call ends naturally when its <Dial> completes.
+            client.calls(child_call_sid).update(url=transfer_url, method="POST")
+
+            print(f"🔄 Transfer (outbound): parent={call_sid} → child={child_call_sid} → target={target_identity}")
+
+        return jsonify({"status": "transferred", "target": target_identity}), 200
+
+    except Exception as e:
+        print(f"❌ Transfer failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Transfer failed: {str(e)}"}), 500
+
+
+@app.route("/call/transfer-twiml", methods=["POST", "GET"])
+def transfer_twiml():
+    """Generate TwiML to connect a call to the target agent.
+    Called by Twilio when a call is being transferred."""
+    target = request.values.get("target")
+    caller_id = os.getenv("TWILIO_CALLER_ID", "+17754602190")
+
+    if not target:
+        response = VoiceResponse()
+        response.say("Transfer failed. No target specified.")
+        response.hangup()
+        return Response(str(response), mimetype="application/xml")
+
+    response = VoiceResponse()
+    response.say("Please hold while we transfer your call.", voice="Polly.Joanna")
+
+    dial = response.dial(
+        caller_id=caller_id,
+        timeout=30,
+        action=f"/call/transfer-status?target={target}",
+        method="POST",
+    )
+    dial.client(target)
+
+    return Response(str(response), mimetype="application/xml")
+
+
+@app.route("/call/transfer-status", methods=["POST"])
+def transfer_status():
+    """Handle the result of a transfer dial attempt.
+    If the target agent didn't answer, send to voicemail."""
+    dial_status = request.values.get("DialCallStatus", "")
+    target = request.values.get("target", "unknown")
+
+    print(f"📞 Transfer dial status: {dial_status} (target: {target})")
+
+    response = VoiceResponse()
+
+    if dial_status in ("completed", "answered"):
+        # Transfer was successful — call ends naturally when either party hangs up
+        response.hangup()
+    else:
+        # Target didn't answer — let the caller know
+        response.say("The person you are being transferred to is not available. Please leave a message after the beep.", voice="Polly.Joanna")
+        response.play("https://softphone.pc-reps.com/beep.mp3")
+        response.record(
+            max_length=60,
+            timeout=0,
+            transcribe=True,
+            transcribe_callback="https://softphone.pc-reps.com/voicemail/save",
+            recording_status_callback="https://softphone.pc-reps.com/recording/complete",
+            play_beep=False,
+        )
+
+    return Response(str(response), mimetype="application/xml")
+
+
+@app.route("/api/calls")
+def get_calls():
+    """Get call history from database with pagination and filtering"""
+    try:
+        page = request.args.get("page", 1, type=int)
+        per_page = request.args.get("per_page", 100, type=int)
+        direction = request.args.get("direction", None)
+
+        # Cap per_page to prevent abuse
+        per_page = min(per_page, 500)
+        offset = (page - 1) * per_page
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Build query with optional direction filter
+        where_clause = ""
+        params = []
+        if direction in ("inbound", "outbound"):
+            where_clause = "WHERE direction = ?"
+            params.append(direction)
+
+        # Get total count for pagination info
+        cur.execute(f"SELECT COUNT(*) as total FROM call_log {where_clause}", params)
+        total = cur.fetchone()["total"]
+
+        # Get paginated results
+        cur.execute(
+            f"SELECT * FROM call_log {where_clause} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+            params + [per_page, offset]
+        )
+        calls = [dict(row) for row in cur.fetchall()]
+        conn.close()
+
+        return jsonify({
+            "calls": calls,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "total_pages": (total + per_page - 1) // per_page
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/calls/unseen-count")
+def get_unseen_call_count():
+    """Get count of unseen missed/inbound calls for notification badge"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) as count FROM call_log
+            WHERE seen = false
+            AND direction = 'inbound'
+            AND status != 'completed'
+        """)
+        result = cur.fetchone()
+        conn.close()
+        return jsonify({"count": result["count"] if result else 0})
+    except Exception as e:
+        # If 'seen' column doesn't exist yet, return 0 gracefully
+        print(f"⚠️ Error getting unseen call count (column may not exist yet): {e}")
+        return jsonify({"count": 0})
+
+
+@app.route("/api/calls/mark-seen", methods=["POST"])
+def mark_calls_seen():
+    """Mark all unseen inbound calls as seen (when user visits call history)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE call_log SET seen = true WHERE seen = false AND direction = 'inbound'")
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        print(f"⚠️ Error marking calls as seen: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/calls/log", methods=["POST"])
+def log_outbound_call():
+    """Log outbound call to database"""
+    print("🔥 /api/calls/log endpoint hit!")
+
+    try:
+        data = request.get_json()
+        print(f"📥 Received data: {data}")
+
+        phone_number = data.get("phone_number")
+        status = data.get("status")
+        call_sid = data.get("call_sid")
+
+        print(f"📞 Parsed: phone={phone_number}, status={status}, sid={call_sid}")
+
+        # Normalize phone number
+        from phone_utils import normalize_phone_number
+
+        normalized_phone = normalize_phone_number(phone_number)
+        print(f"📱 Normalized phone: {normalized_phone}")
+
+        if not normalized_phone:
+            print("❌ Invalid phone number")
+            return jsonify({"error": "Invalid phone number"}), 400
+
+        # Get contact name
+        contact_name = None
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM contacts WHERE phone_primary = ? OR phone_secondary = ?",
+            (normalized_phone, normalized_phone),
+        )
+        row = cursor.fetchone()
+        contact_name = row["name"] if row else None
+
+        print(f"👤 Contact name: {contact_name}")
+        print("✅ About to insert into database")
+
+        # Log the call - update if exists, insert if new
+        cur = conn.cursor()
+
+        # Check if call already exists
+        if call_sid:
+            cur.execute(
+                "SELECT id FROM call_log WHERE twilio_call_sid = ?", (call_sid,)
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                # Update existing call — do NOT overwrite original timestamp
+                cur.execute(
+                    """
+                        UPDATE call_log
+                        SET status = ?
+                        WHERE twilio_call_sid = ?
+                    """,
+                    (status, call_sid),
+                )
+                print(f"✅ Updated existing call record (SID: {call_sid})")
+            else:
+                # Insert new call — always store UTC timestamps
+                cur.execute(
+                    """
+                        INSERT INTO call_log (
+                            phone_number, direction, status, call_type,
+                            caller_name, twilio_call_sid, timestamp, user_id
+                        ) VALUES (?, 'outbound', ?, 'voice', ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_phone,
+                        status,
+                        contact_name,
+                        call_sid,
+                        datetime.now(timezone.utc).isoformat(),
+                        current_user.id if current_user.is_authenticated else None,
+                    ),
+                )
+                print(f"✅ Inserted new call record (SID: {call_sid})")
+        else:
+            # No call_sid, just insert (shouldn't happen but fallback)
+            cur.execute(
+                """
+                INSERT INTO call_log (
+                    phone_number, direction, status, call_type,
+                    caller_name, twilio_call_sid, timestamp, user_id
+                ) VALUES (?, 'outbound', ?, 'voice', ?, ?, ?, ?)
+            """,
+                (
+                    normalized_phone,
+                    status,
+                    contact_name,
+                    "",
+                    datetime.now(timezone.utc).isoformat(),
+                    current_user.id if current_user.is_authenticated else None,
+                ),
+            )
+            print("✅ Inserted new call record (no SID)")
+
+        conn.commit()
+        conn.close()
+
+        # Notify NovaCore to log this outbound call on the customer's ticket
+        try:
+            from messaging import notify_novacore_ticket
+            notify_novacore_ticket(normalized_phone, "outbound", "call", staff_user_id=current_user.id if current_user.is_authenticated else None)
+        except Exception as e2:
+            print(f"⚠️ Error notifying NovaCore of outbound call: {e2}")
+
+        return jsonify({"status": "logged"})
+    except Exception as e:
+        print(f"❌ Error in log_outbound_call: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/voicemails")
+def get_voicemails():
+    return jsonify({"message": "Voicemail API not yet connected to database"}), 200
+
+
+@app.route("/media-proxy")
+def media_proxy():
+    url = request.args.get("url")
+
+    if not url:
+        return "Missing URL", 400
+
+    # SEC-3: Only allow proxying Twilio media URLs — prevents SSRF attacks
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    allowed_hosts = [
+        "api.twilio.com",
+        "media.twiliocdn.com",
+        "s3-external-1.amazonaws.com",  # Twilio stores MMS media here
+    ]
+    if not parsed.hostname or not any(parsed.hostname.endswith(host) for host in allowed_hosts):
+        print(f"🛑 Blocked proxy request to non-Twilio URL: {url}")
+        return "Forbidden: only Twilio media URLs allowed", 403
+
+    auth = (os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+    try:
+        response = requests.get(url, auth=auth, timeout=10)
+        response.raise_for_status()
+        return Response(response.content, mimetype=response.headers.get("Content-Type", "application/octet-stream"))
+    except Exception as e:
+        print(f"❌ Proxy error for {url} — {e}")
+        return "Error fetching media", 500
+
+
+@app.route("/uploads/<path:filename>")
+def uploaded_file(filename):
+    # SEC-6: Reject path traversal attempts (double-dot, backslash)
+    if ".." in filename or "\\" in filename:
+        return "Forbidden", 403
+    return send_from_directory("static/uploads", filename)
+
+
+# React app routing
+# Suspicious file extensions and paths that bots probe for
+BOT_PROBE_EXTENSIONS = (
+    ".php",
+    ".asp",
+    ".aspx",
+    ".jsp",
+    ".cgi",
+    ".pl",
+    ".env",
+    ".git",
+    ".svn",
+    ".bak",
+    ".sql",
+    ".db",
+    ".log",
+    ".ini",
+    ".conf",
+    ".yml",
+    ".yaml",
+    ".xml",
+    ".json.bak",
+)
+BOT_PROBE_PATHS = (
+    "wp-",
+    "wordpress",
+    "xmlrpc",
+    "admin.php",
+    "login.php",
+    "shell",
+    "eval-stdin",
+    "phpinfo",
+    "phpmyadmin",
+    "adminer",
+    "connector.sds",
+    "geoserver",
+    "/.env",
+    "/.git",
+    "/.svn",
+)
+
+ERROR_PAGES_DIR = os.path.join(os.path.dirname(__file__), "error_pages")
+
+
+def is_bot_probe(path):
+    """Check if a request path looks like a bot/scanner probe"""
+    path_lower = path.lower()
+    if any(path_lower.endswith(ext) for ext in BOT_PROBE_EXTENSIONS):
+        return True
+    if any(probe in path_lower for probe in BOT_PROBE_PATHS):
+        return True
+    return False
+
+
+ERROR_PAGES_DIR = os.path.join(os.path.dirname(__file__), "error_pages")
+
+
+@app.route("/error_pages/<path:filename>")
+def serve_error_assets(filename):
+    return send_from_directory(ERROR_PAGES_DIR, filename)
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_react_app(path):
+    # If it looks like a bot probe, serve the fun 404 page
+    if path and is_bot_probe(path):
+        ip = request.headers.get(
+            "X-Real-IP", request.headers.get("X-Forwarded-For", request.remote_addr)
+        )
+        print(f"🤡 Bot probe blocked with 404 page: /{path} from IP {ip}")
+        return send_from_directory(ERROR_PAGES_DIR, "404.html"), 404
+
+    full_path = os.path.join(app.static_folder, path)
+    if path != "" and os.path.exists(full_path):
+        return send_from_directory(app.static_folder, path)
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return send_from_directory(ERROR_PAGES_DIR, "404.html"), 404
+
+
+# Dictionary to track online users: {user_id: {'sid': socket_id, 'employee_id': 'PCR-001', 'name': 'Matt', 'last_heartbeat': timestamp}}
+online_users = {}
+
+
+@socketio.on("connect")
+def handle_connect():
+    print(f"🔌 Client connected: {request.sid}")
+    print(
+        f"🔢 Total connected clients: {len(socketio.server.manager.rooms.get('/', {}).keys()) if hasattr(socketio.server, 'manager') else 'unknown'}"
+    )
+    return True
+
+
+@socketio.on("user_login")
+def handle_user_login(data):
+    """
+    Called when a user logs in and establishes WebSocket connection.
+    Frontend sends: {user_id, employee_id, name}
+    """
+    try:
+        user_id = data.get("user_id")
+        employee_id = data.get("employee_id")
+        name = data.get("name")
+
+        if not user_id:
+            print("❌ user_login event missing user_id")
+            return
+
+        # Add/update user in online tracking
+        online_users[user_id] = {
+            "sid": request.sid,
+            "employee_id": employee_id,
+            "name": name,
+            "last_heartbeat": datetime.now(),
+        }
+
+        # Update last_activity in database (users table is in NovaCore PostgreSQL)
+        # This is handled by NovaCore, skip here
+
+        print(f"✅ User {name} ({employee_id}) logged in - Socket ID: {request.sid}")
+        print(f"👥 Online users: {len(online_users)}")
+
+        # Broadcast updated online user list to all clients
+        socketio.emit(
+            "users_online_update",
+            {
+                "online_users": [
+                    {
+                        "user_id": uid,
+                        "employee_id": info["employee_id"],
+                        "name": info["name"],
+                    }
+                    for uid, info in online_users.items()
+                ]
+            },
+        )
+
+    except Exception as e:
+        print(f"❌ Error in user_login: {e}")
+
+
+@socketio.on("user_heartbeat")
+def handle_user_heartbeat(data):
+    """
+    Periodic heartbeat from frontend to confirm user is still online.
+    Frontend sends: {user_id}
+    """
+    try:
+        user_id = data.get("user_id")
+
+        if user_id and user_id in online_users:
+            online_users[user_id]["last_heartbeat"] = datetime.now()
+
+            # Update last_activity in database (users table is in NovaCore PostgreSQL)
+            # This is handled by NovaCore, skip here
+
+    except Exception as e:
+        print(f"❌ Error in user_heartbeat: {e}")
+
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    """Handle client disconnection - remove user from online tracking"""
+    try:
+        print(f"🔌 Client disconnected: {request.sid}")
+
+        # Find and remove user by socket ID
+        user_to_remove = None
+        for user_id, info in online_users.items():
+            if info["sid"] == request.sid:
+                user_to_remove = user_id
+                print(f"👋 User {info['name']} ({info['employee_id']}) went offline")
+                break
+
+        if user_to_remove:
+            del online_users[user_to_remove]
+
+            # Broadcast updated online user list to all clients
+            socketio.emit(
+                "users_online_update",
+                {
+                    "online_users": [
+                        {
+                            "user_id": uid,
+                            "employee_id": info["employee_id"],
+                            "name": info["name"],
+                        }
+                        for uid, info in online_users.items()
+                    ]
+                },
+            )
+
+        print(
+            f"🔢 Total connected clients: {len(socketio.server.manager.rooms.get('/', {}).keys()) if hasattr(socketio.server, 'manager') else 'unknown'}"
+        )
+        print(f"👥 Online users: {len(online_users)}")
+
+    except Exception as e:
+        print(f"❌ Error in disconnect handler: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
+# Development/testing routes
+@app.route("/test-websocket")
+def test_websocket():
+    socketio.emit(
+        "new_message",
+        {
+            "phone_number": "+1234567890",
+            "message": "TEST MESSAGE",
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+    )
+    return "Test message sent to all clients"
+
+
+@app.route("/test-real-sms")
+def test_real_sms():
+    print(f"🧪 Testing real SMS format")
+    socketio.emit(
+        "new_message",
+        {
+            "phone_number": "+16193163652",
+            "message": "TEST REAL SMS FORMAT",
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+    )
+    return "Real SMS format test sent"
+
+
+# Settings and Greetings API Routes
+@app.route("/api/greetings")
+def get_greetings():
+    """Get all greetings"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM greetings ORDER BY type, name")
+        greetings = [dict(row) for row in cur.fetchall()]
+        conn.close()
+        return jsonify(greetings)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/set-active", methods=["POST"])
+def set_active_greeting():
+    """Set the active greeting"""
+    try:
+        data = request.get_json()
+        greeting_id = data.get("greeting_id")
+
+        if not greeting_id:
+            return jsonify({"error": "Missing greeting_id"}), 400
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Get greeting info for logging
+        cur.execute("SELECT name, type FROM greetings WHERE id = ?", (greeting_id,))
+        greeting = cur.fetchone()
+
+        # Set all greetings to inactive
+        cur.execute("UPDATE greetings SET is_active = 0")
+        # Set the selected greeting to active
+        cur.execute("UPDATE greetings SET is_active = 1 WHERE id = ?", (greeting_id,))
+        conn.commit()
+
+        # Log the activation
+        if greeting:
+            log_analytics_event(greeting["type"], greeting["name"], "activated")
+
+        conn.close()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/<int:greeting_id>", methods=["PUT"])
+def update_greeting(greeting_id):
+    """Update a greeting's message"""
+    try:
+        data = request.get_json()
+        auto_sms_message = data.get("auto_sms_message")
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE greetings 
+            SET auto_sms_message = ?, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
+        """,
+            (auto_sms_message, greeting_id),
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/<int:greeting_id>/audio", methods=["POST"])
+def upload_greeting_audio(greeting_id):
+    """Upload audio file for a greeting with backup of existing file"""
+    try:
+        if "audio" not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+
+        audio_file = request.files["audio"]
+        if audio_file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+
+        # Get greeting info
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT name, type FROM greetings WHERE id = ?", (greeting_id,))
+        greeting = cur.fetchone()
+
+        if not greeting:
+            return jsonify({"error": "Greeting not found"}), 404
+
+        # Create the correct directory (where your current files are)
+        upload_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Generate the expected filename
+        import re
+
+        safe_type = re.sub(r"[^\w\-_]", "_", greeting["type"])
+        expected_filename = f"new_{safe_type}.mp3"
+        expected_filepath = os.path.join(upload_dir, expected_filename)
+
+        # Create backup of existing file if it exists
+        backup_created = False
+        if os.path.exists(expected_filepath):
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"new_{safe_type}_backup_{timestamp}.mp3"
+            backup_filepath = os.path.join(upload_dir, backup_filename)
+
+            try:
+                import shutil
+
+                shutil.copy2(expected_filepath, backup_filepath)
+                backup_created = True
+                print(f"📦 Created backup: {backup_filename}")
+            except Exception as e:
+                print(f"⚠️ Failed to create backup: {e}")
+
+        # Save uploaded file temporarily, then convert to Twilio-compatible format
+        import subprocess
+
+        temp_input = os.path.join(upload_dir, f"temp_upload_{greeting_id}.tmp")
+        audio_file.save(temp_input)
+
+        # Convert to 8000Hz mono (Twilio telephone standard) using ffmpeg
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",  # Overwrite output
+                    "-i",
+                    temp_input,  # Input file
+                    "-ar",
+                    "8000",  # Sample rate: 8kHz (telephone standard)
+                    "-ac",
+                    "1",  # Mono audio
+                    "-b:a",
+                    "32k",  # Bitrate (good for voice)
+                    expected_filepath,  # Output file
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                print(f"⚠️ ffmpeg error: {result.stderr}")
+                # Fallback: save original if conversion fails
+                import shutil
+
+                shutil.move(temp_input, expected_filepath)
+                print("⚠️ Saved original file (conversion failed)")
+            else:
+                print(f"✅ Converted to 8000Hz mono: {expected_filename}")
+                os.remove(temp_input)  # Clean up temp file
+
+        except subprocess.TimeoutExpired:
+            print("⚠️ ffmpeg timeout - saving original")
+            import shutil
+
+            shutil.move(temp_input, expected_filepath)
+        except FileNotFoundError:
+            print("⚠️ ffmpeg not found - saving original")
+            import shutil
+
+            shutil.move(temp_input, expected_filepath)
+
+        # Update database with the standard URL
+        audio_url = f"https://softphone.pc-reps.com/{expected_filename}"
+
+        cur.execute(
+            """
+            UPDATE greetings 
+            SET audio_url = ?, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
+        """,
+            (audio_url, greeting_id),
+        )
+        conn.commit()
+        conn.close()
+
+        response_message = f"Audio saved as {expected_filename}"
+        if backup_created:
+            response_message += f" (previous version backed up)"
+
+        return jsonify(
+            {
+                "status": "success",
+                "audio_url": audio_url,
+                "filename": expected_filename,
+                "backup_created": backup_created,
+                "message": response_message,
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/<int:greeting_id>/audio-library", methods=["GET"])
+def get_audio_library(greeting_id):
+    """Get list of available audio files for a greeting type"""
+    try:
+        # Get greeting type
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT type FROM greetings WHERE id = ?", (greeting_id,))
+        greeting = cur.fetchone()
+        conn.close()
+
+        if not greeting:
+            return jsonify({"error": "Greeting not found"}), 404
+
+        greeting_type = greeting["type"]
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+        # Find all MP3 files matching this greeting type
+        import glob
+
+        pattern = os.path.join(upload_dir, f"new_{greeting_type}*.mp3")
+        files = glob.glob(pattern)
+
+        audio_files = []
+        for filepath in files:
+            filename = os.path.basename(filepath)
+            stat = os.stat(filepath)
+            audio_files.append(
+                {
+                    "filename": filename,
+                    "url": f"https://softphone.pc-reps.com/{filename}",
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                }
+            )
+
+        # Sort by modified date, newest first
+        audio_files.sort(key=lambda x: x["modified"], reverse=True)
+
+        return jsonify({"files": audio_files, "greeting_type": greeting_type})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/<int:greeting_id>/record", methods=["POST"])
+def save_recorded_audio(greeting_id):
+    """Save recorded audio from browser (webm) and convert to MP3"""
+    try:
+        if "audio" not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+
+        audio_file = request.files["audio"]
+
+        # Get greeting info
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT name, type FROM greetings WHERE id = ?", (greeting_id,))
+        greeting = cur.fetchone()
+        conn.close()
+
+        if not greeting:
+            return jsonify({"error": "Greeting not found"}), 404
+
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+        # Generate filenames
+        import re
+
+        safe_type = re.sub(r"[^\w\-_]", "_", greeting["type"])
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Save webm temporarily
+        temp_webm = os.path.join(upload_dir, f"temp_{safe_type}_{timestamp}.webm")
+        final_mp3 = os.path.join(upload_dir, f"new_{safe_type}_{timestamp}.mp3")
+
+        audio_file.save(temp_webm)
+
+        # Convert to MP3 using ffmpeg
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    temp_webm,
+                    "-acodec",
+                    "libmp3lame",
+                    "-ab",
+                    "128k",
+                    "-ar",
+                    "44100",
+                    "-y",
+                    final_mp3,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                raise Exception(f"FFmpeg error: {result.stderr}")
+
+        finally:
+            # Clean up temp file
+            if os.path.exists(temp_webm):
+                os.remove(temp_webm)
+
+        final_filename = os.path.basename(final_mp3)
+        audio_url = f"https://softphone.pc-reps.com/static/{final_filename}"
+
+        return jsonify(
+            {
+                "status": "success",
+                "audio_url": audio_url,
+                "filename": final_filename,
+                "message": f"Recording saved as {final_filename}",
+            }
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/<int:greeting_id>/select-audio", methods=["POST"])
+def select_greeting_audio(greeting_id):
+    """Select an existing audio file for a greeting"""
+    try:
+        data = request.get_json()
+        filename = data.get("filename")
+
+        if not filename:
+            return jsonify({"error": "No filename provided"}), 400
+
+        # Verify file exists
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+        filepath = os.path.join(upload_dir, filename)
+
+        if not os.path.exists(filepath):
+            return jsonify({"error": "File not found"}), 404
+
+        # Update database
+        audio_url = f"https://softphone.pc-reps.com/static/{filename}"
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE greetings 
+            SET audio_url = ?, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
+        """,
+            (audio_url, greeting_id),
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify(
+            {
+                "status": "success",
+                "audio_url": audio_url,
+                "message": f"Now using {filename}",
+            }
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/vacation-dates", methods=["GET", "POST"])
+def vacation_dates():
+    """Get or set vacation dates"""
+    try:
+        if request.method == "GET":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT setting_key, setting_value FROM app_settings 
+                WHERE setting_key IN ('vacation_start_date', 'vacation_end_date')
+            """
+            )
+            rows = cur.fetchall()
+            conn.close()
+
+            dates = {}
+            for row in rows:
+                if "start" in row["setting_key"]:
+                    dates["start_date"] = row["setting_value"]
+                elif "end" in row["setting_key"]:
+                    dates["end_date"] = row["setting_value"]
+
+            return jsonify(dates)
+
+        elif request.method == "POST":
+            data = request.get_json()
+            start_date = data.get("start_date")
+            end_date = data.get("end_date")
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            # Update or insert vacation dates
+            cur.execute(
+                """
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('vacation_start_date', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+            """,
+                (start_date, start_date),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('vacation_end_date', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+            """,
+                (end_date, end_date),
+            )
+
+            conn.commit()
+            conn.close()
+
+            return jsonify({"status": "success"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/static/greetings/<path:filename>")
+def serve_greeting_audio(filename):
+    return send_from_directory("static/greetings", filename)
+
+
+@app.route("/static/<path:filename>")
+def serve_static_audio(filename):
+    return send_from_directory("static", filename)
+
+
+@app.route("/recordings/calls/<filename>")
+def serve_call_recording(filename):
+    """Serve call recording files"""
+    recordings_dir = os.path.join(os.path.dirname(__file__), "recordings", "calls")
+    return send_from_directory(recordings_dir, filename)
+
+
+@app.route("/api/settings/recording-notice", methods=["GET"])
+def get_recording_notice():
+    """Get info about the current recording notice audio"""
+    try:
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+        filepath = os.path.join(upload_dir, "recording_notice.mp3")
+
+        if os.path.exists(filepath):
+            stat = os.stat(filepath)
+            return jsonify(
+                {
+                    "exists": True,
+                    "url": "https://softphone.pc-reps.com/static/recording_notice.mp3",
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                }
+            )
+        else:
+            return jsonify({"exists": False, "url": None})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/recording-notice", methods=["POST"])
+def upload_recording_notice():
+    """Upload recording notice audio file"""
+    try:
+        if "audio" not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+
+        audio_file = request.files["audio"]
+        if audio_file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+        filepath = os.path.join(upload_dir, "recording_notice.mp3")
+
+        # Backup existing file if it exists
+        backup_created = False
+        if os.path.exists(filepath):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(
+                upload_dir, f"recording_notice_backup_{timestamp}.mp3"
+            )
+            try:
+                import shutil
+
+                shutil.copy2(filepath, backup_path)
+                backup_created = True
+                print(f"📦 Created backup: recording_notice_backup_{timestamp}.mp3")
+            except Exception as e:
+                print(f"⚠️ Failed to create backup: {e}")
+
+        # Save uploaded file temporarily, then convert to Twilio-compatible format
+        import subprocess
+
+        temp_input = os.path.join(upload_dir, "temp_recording_notice.tmp")
+        audio_file.save(temp_input)
+
+        # Convert to 8000Hz mono (Twilio telephone standard) using ffmpeg
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    temp_input,
+                    "-ar",
+                    "8000",
+                    "-ac",
+                    "1",
+                    "-b:a",
+                    "32k",
+                    filepath,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                print(f"⚠️ ffmpeg error: {result.stderr}")
+                import shutil
+
+                shutil.move(temp_input, filepath)
+                print("⚠️ Saved original file (conversion failed)")
+            else:
+                print(f"✅ Converted recording notice to 8000Hz mono")
+                os.remove(temp_input)
+
+        except subprocess.TimeoutExpired:
+            print("⚠️ ffmpeg timeout - saving original")
+            import shutil
+
+            shutil.move(temp_input, filepath)
+        except FileNotFoundError:
+            print("⚠️ ffmpeg not found - saving original")
+            import shutil
+
+            shutil.move(temp_input, filepath)
+
+        return jsonify(
+            {
+                "status": "success",
+                "url": "https://softphone.pc-reps.com/static/recording_notice.mp3",
+                "backup_created": backup_created,
+                "message": "Recording notice uploaded successfully",
+            }
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/recording-notice/record", methods=["POST"])
+def save_recorded_notice():
+    """Save recorded audio from browser (webm) and convert to MP3 for recording notice"""
+    try:
+        if "audio" not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+
+        audio_file = request.files["audio"]
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+        filepath = os.path.join(upload_dir, "recording_notice.mp3")
+
+        # Backup existing file if it exists
+        backup_created = False
+        if os.path.exists(filepath):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(
+                upload_dir, f"recording_notice_backup_{timestamp}.mp3"
+            )
+            try:
+                import shutil
+
+                shutil.copy2(filepath, backup_path)
+                backup_created = True
+            except Exception as e:
+                print(f"⚠️ Failed to create backup: {e}")
+
+        # Save webm temporarily
+        temp_webm = os.path.join(upload_dir, "temp_recording_notice.webm")
+        audio_file.save(temp_webm)
+
+        # Convert to MP3 using ffmpeg (8000Hz mono for Twilio)
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    temp_webm,
+                    "-ar",
+                    "8000",
+                    "-ac",
+                    "1",
+                    "-b:a",
+                    "32k",
+                    filepath,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                raise Exception(f"FFmpeg error: {result.stderr}")
+
+        finally:
+            if os.path.exists(temp_webm):
+                os.remove(temp_webm)
+
+        return jsonify(
+            {
+                "status": "success",
+                "url": "https://softphone.pc-reps.com/static/recording_notice.mp3",
+                "backup_created": backup_created,
+                "message": "Recording notice saved successfully",
+            }
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def check_vacation_auto_return():
+    """Check if vacation period has ended and auto-return to auto mode"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Check if vacation greeting is currently active
+        cur.execute(
+            "SELECT * FROM greetings WHERE is_active = 1 AND type = 'vacation' LIMIT 1"
+        )
+        active_vacation = cur.fetchone()
+
+        if not active_vacation:
+            conn.close()
+            return  # Not in vacation mode
+
+        # Get vacation end date
+        cur.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key = 'vacation_end_date'"
+        )
+        end_date_row = cur.fetchone()
+
+        if not end_date_row or not end_date_row["setting_value"]:
+            conn.close()
+            return  # No end date set
+
+        # Check if vacation period has ended
+        end_date = datetime.fromisoformat(end_date_row["setting_value"])
+        now = datetime.now()
+
+        if now.date() > end_date.date():
+            # Vacation period has ended, switch to auto mode
+            cur.execute("UPDATE greetings SET is_active = 0")  # Deactivate all
+            cur.execute(
+                "UPDATE greetings SET is_active = 1 WHERE type = 'auto'"
+            )  # Activate auto
+            conn.commit()
+            conn.close()
+
+            print(
+                f"🔄 Auto-return: Vacation ended on {end_date.date()}, switched back to Auto Mode"
+            )
+            return True
+
+        conn.close()
+
+    except Exception as e:
+        print(f"⌚ Error in vacation auto-return check: {e}")
+        return False
+
+
+# Schedule vacation auto-return check (runs every hour)
+import threading
+import time
+
+
+def vacation_check_loop():
+    while True:
+        try:
+            check_vacation_auto_return()
+            time.sleep(3600)  # Check every hour
+        except Exception as e:
+            print(f"⌚ Error in vacation check loop: {e}")
+            time.sleep(3600)
+
+
+# Start vacation check thread
+vacation_thread = threading.Thread(target=vacation_check_loop, daemon=True)
+vacation_thread.start()
+
+
+@app.route("/api/greetings/preview")
+def preview_greeting():
+    """Preview what customers would experience without actually triggering it"""
+    try:
+        preview_type = request.args.get("type", "call")  # 'call' or 'text'
+
+        # Get current active greeting
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM greetings WHERE is_active = 1 LIMIT 1")
+        active_greeting = cur.fetchone()
+
+        if not active_greeting:
+            return jsonify({"error": "No active greeting found"}), 404
+
+        # Determine what would happen based on current settings
+        from incoming import is_open_now
+
+        preview_data = {
+            "mode": active_greeting["name"],
+            "type": active_greeting["type"],
+        }
+
+        if active_greeting["type"] == "auto":
+            # Auto mode - depends on current time
+            # Fetch templates from database
+            default_open = "Hi, this is PC Reps 👋 For the fastest response, just reply to this text with your question. Hours: Tue, Thu, Sat 10–6. Walk-ins welcome. Reply STOP to opt out."
+            default_closed = "Hi, this is PC Reps 👋 We're currently closed (open Tue, Thu, Sat 10–6). For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
+
+            cur.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_open_message'"
+            )
+            open_row = cur.fetchone()
+            cur.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_closed_message'"
+            )
+            closed_row = cur.fetchone()
+
+            open_message = open_row["setting_value"] if open_row else default_open
+            closed_message = (
+                closed_row["setting_value"] if closed_row else default_closed
+            )
+
+            if is_open_now():
+                # Get open greeting
+                cur.execute("SELECT * FROM greetings WHERE type = 'open' LIMIT 1")
+                open_greeting = cur.fetchone()
+                preview_data.update(
+                    {
+                        "status": "Currently OPEN (Auto Mode)",
+                        "audio_url": (
+                            open_greeting["audio_url"]
+                            if open_greeting
+                            else "new_open.mp3"
+                        ),
+                        "sms_message": open_message,
+                    }
+                )
+            else:
+                # Get closed greeting
+                cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+                closed_greeting = cur.fetchone()
+                preview_data.update(
+                    {
+                        "status": "Currently CLOSED (Auto Mode)",
+                        "audio_url": (
+                            closed_greeting["audio_url"]
+                            if closed_greeting
+                            else "new_closed.mp3"
+                        ),
+                        "sms_message": closed_message,
+                    }
+                )
+        else:
+            # Manual mode - use specific greeting
+            preview_data.update(
+                {
+                    "status": f"Manual Override: {active_greeting['name']}",
+                    "audio_url": active_greeting["audio_url"] or "new_closed.mp3",
+                    "sms_message": active_greeting["auto_sms_message"],
+                }
+            )
+
+        # Add experience-specific details
+        if preview_type == "call":
+            priority_types = ["sick", "vacation", "holiday"]
+            bypass_conversation = active_greeting["type"] in priority_types
+
+            preview_data["call_flow"] = {
+                "step1": f"Caller hears: {preview_data['audio_url']}",
+                "step2": f"After 45 seconds: SMS sent {'(bypasses conversation check)' if bypass_conversation else '(respects conversation history)'}",
+                "step3": "24-hour cooldown begins",
+            }
+        elif preview_type == "text":
+            priority_types = ["sick", "vacation", "holiday"]
+            if active_greeting["type"] in priority_types:
+                preview_data["text_flow"] = {
+                    "step1": "Customer texts arrive normally",
+                    "step2": f"Immediate auto-reply: {preview_data['sms_message']}",
+                    "step3": "24-hour cooldown for status replies",
+                }
+            else:
+                preview_data["text_flow"] = {
+                    "step1": "Customer texts arrive normally",
+                    "step2": "No auto-reply (only priority statuses send text auto-replies)",
+                    "step3": "Normal conversation flow",
+                }
+
+        conn.close()
+        return jsonify(preview_data)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analytics")
+def get_analytics():
+    """Get usage analytics for the specified time period"""
+    try:
+        days = int(request.args.get("days", 7))
+        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+        print(f"📊 Analytics request: {days} days, cutoff: {cutoff_date}")
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Check if tables exist (PostgreSQL version)
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        )
+        tables = [row["table_name"] for row in cur.fetchall()]
+        print(f"📊 Available tables: {tables}")
+
+        # Get call statistics
+        try:
+            cur.execute(
+                """
+                SELECT status, COUNT(*) as count
+                FROM call_log 
+                WHERE timestamp > ? 
+                GROUP BY status
+            """,
+                (cutoff_date,),
+            )
+            calls_data = dict(cur.fetchall())
+            total_calls = sum(calls_data.values())
+            print(f"📊 Calls data: {calls_data}")
+        except Exception as e:
+            print(f"📊 Call stats error: {e}")
+            calls_data = {}
+            total_calls = 0
+
+        # Get auto-SMS statistics
+        try:
+            cur.execute(
+                """
+                SELECT COUNT(*) as count
+                FROM messages 
+                WHERE direction = 'outbound' 
+                AND is_auto_sms = 1 
+                AND timestamp > ?
+            """,
+                (cutoff_date,),
+            )
+            total_auto_sms = cur.fetchone()["count"]
+            print(f"📊 Auto SMS count: {total_auto_sms}")
+        except Exception as e:
+            print(f"📊 Auto SMS stats error: {e}")
+            total_auto_sms = 0
+
+        # Get SMS breakdown by greeting type
+        try:
+            cur.execute(
+                """
+                SELECT 
+                    CASE 
+                        WHEN body LIKE '%sick%' THEN 'sick'
+                        WHEN body LIKE '%vacation%' THEN 'vacation'
+                        WHEN body LIKE '%holiday%' THEN 'holiday'
+                        WHEN body LIKE '%closed%' THEN 'closed'
+                        WHEN body LIKE '%open%' OR body LIKE '%Hours: Tue%' THEN 'open'
+                        ELSE 'other'
+                    END as type,
+                    COUNT(*) as count
+                FROM messages 
+                WHERE direction = 'outbound' 
+                AND is_auto_sms = 1 
+                AND timestamp > ?
+                GROUP BY type
+            """,
+                (cutoff_date,),
+            )
+            sms_data = dict(cur.fetchall())
+            print(f"📊 SMS breakdown: {sms_data}")
+        except Exception as e:
+            print(f"📊 SMS breakdown error: {e}")
+            sms_data = {}
+
+        # Get greeting activations from analytics table (if it exists)
+        activation_data = {}
+        total_activations = 0
+        recent_activations = []
+
+        if "greeting_analytics" in tables:
+            try:
+                cur.execute(
+                    """
+                    SELECT greeting_type, COUNT(*) as count
+                    FROM greeting_analytics 
+                    WHERE event_type = 'activated' 
+                    AND timestamp > ?
+                    GROUP BY greeting_type
+                """,
+                    (cutoff_date,),
+                )
+                activation_data = dict(cur.fetchall())
+                total_activations = sum(activation_data.values())
+
+                cur.execute(
+                    """
+                    SELECT greeting_name, timestamp
+                    FROM greeting_analytics 
+                    WHERE event_type = 'activated' 
+                    AND timestamp > ?
+                    ORDER BY timestamp DESC 
+                    LIMIT 5
+                """,
+                    (cutoff_date,),
+                )
+                recent_activations = [dict(row) for row in cur.fetchall()]
+                print(
+                    f"📊 Activations: {activation_data}, Recent: {recent_activations}"
+                )
+            except Exception as e:
+                print(f"📊 Analytics table error: {e}")
+        else:
+            print("📊 greeting_analytics table doesn't exist")
+
+        result = {
+            "total_calls": total_calls,
+            "calls_by_type": calls_data,
+            "total_auto_sms": total_auto_sms,
+            "sms_by_type": sms_data,
+            "total_activations": total_activations,
+            "activation_by_type": activation_data,
+            "recent_activations": recent_activations,
+        }
+        print(f"📊 Returning: {result}")
+        conn.close()
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"📊 Analytics error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+
+# log_analytics_event moved to analytics.py to avoid circular imports
+from analytics import log_analytics_event
+
+
+@app.route("/api/repairshopr-lookup/<phone_number>")
+def repairshopr_lookup(phone_number):
+    """Look up RepairShopr URL for a phone number"""
+    try:
+        import re
+        import requests
+
+        # Normalize phone number (remove non-digits, keep last 10)
+        normalized_phone = re.sub(r"\D", "", phone_number)[-10:]
+
+        if not normalized_phone:
+            return jsonify({"error": "Invalid phone number"}), 400
+
+        headers = {"Authorization": f"Bearer {os.getenv('REPAIRSHOPR_API_KEY')}"}
+        base_url = os.getenv("REPAIRSHOPR_BASE_URL")
+
+        if not headers["Authorization"] or not base_url:
+            return jsonify({"error": "RepairShopr API not configured"}), 500
+
+        # Search for customer by phone number
+        search_url = f"{base_url}/customers"
+        params = {"query": normalized_phone}
+
+        print(f"🔍 RepairShopr lookup for: {normalized_phone}")
+        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+
+        if resp.status_code != 200:
+            print(f"❌ RepairShopr API error: {resp.status_code} - {resp.text}")
+            return jsonify({"error": "RepairShopr API error"}), 500
+
+        data = resp.json()
+        customers = data.get("customers", [])
+
+        if not customers:
+            print(f"📞 No customer found, checking leads...")
+
+            # Search for leads by phone number
+            leads_url = f"{base_url}/leads"
+            leads_params = {"query": normalized_phone}
+
+            leads_resp = requests.get(
+                leads_url, headers=headers, params=leads_params, timeout=10
+            )
+
+            if leads_resp.status_code == 200:
+                leads_data = leads_resp.json()
+                leads = leads_data.get("leads", [])
+
+                if leads:
+                    # Found a lead, open it
+                    lead = leads[0]
+                    lead_id = lead.get("id")
+                    url = f"https://pcreps.repairshopr.com/leads/{lead_id}/convert"
+                    print(f"🎯 Found lead: {lead_id}")
+                    return jsonify({"url": url, "type": "lead", "lead_id": lead_id})
+
+            # No customer or lead found
+            return jsonify({"error": "No customer or lead found in RepairShopr"}), 404
+
+        customer = customers[0]
+        customer_id = customer.get("id")
+
+        # Check for open tickets for this customer
+        tickets_url = f"{base_url}/tickets"
+        ticket_params = {"customer_id": customer_id}
+
+        ticket_resp = requests.get(
+            tickets_url, headers=headers, params=ticket_params, timeout=10
+        )
+
+        if ticket_resp.status_code == 200:
+            ticket_data = ticket_resp.json()
+            tickets = ticket_data.get("tickets", [])
+
+            # Debug: Print all ticket statuses to see what RepairShopr actually uses
+            print(f"🔍 All tickets for customer {customer_id}:")
+            for ticket in tickets:
+                print(
+                    f"  - Ticket {ticket.get('id')}: Status = '{ticket.get('status')}', Subject = '{ticket.get('subject', 'No subject')[:50]}'"
+                )
+
+            # Look for open tickets - all RepairShopr statuses except cancelled/resolved
+            open_statuses = [
+                "New",
+                "In Progress",
+                "On Site",
+                "Scheduled",
+                "Sourcing Parts",
+                "Waiting for Parts",
+                "Contact Customer",
+                "Waiting on Customer",
+                "Customer Reply",
+                "Quote Ready",
+                "Pickup Device",
+                "Rescheduled",
+                "FlashBack Data",
+                "Ready for Pick-Up",
+                "Ready for Drop Off",
+                # Excluded: "Cancelled Ticket", "Resolved"
+            ]
+
+            open_tickets = [t for t in tickets if t.get("status") in open_statuses]
+
+            print(
+                f"📋 Found {len(open_tickets)} open tickets out of {len(tickets)} total tickets"
+            )
+
+            if open_tickets:
+                # Open the most recent open ticket
+                ticket_id = open_tickets[0].get("id")
+                ticket_status = open_tickets[0].get("status")
+                url = f"https://pcreps.repairshopr.com/tickets/{ticket_id}"
+                print(f"🎫 Opening ticket {ticket_id} with status '{ticket_status}'")
+                return jsonify(
+                    {
+                        "url": url,
+                        "type": "ticket",
+                        "ticket_id": ticket_id,
+                        "status": ticket_status,
+                    }
+                )
+
+        # No open tickets, open customer profile
+        url = f"https://pcreps.repairshopr.com/customers/{customer_id}"
+        print(f"👤 Opening customer profile: {customer_id}")
+        return jsonify({"url": url, "type": "customer", "customer_id": customer_id})
+
+    except requests.RequestException as e:
+        print(f"❌ RepairShopr API request failed: {e}")
+        return jsonify({"error": "Failed to connect to RepairShopr"}), 500
+    except Exception as e:
+        print(f"❌ RepairShopr lookup error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/add-dnd", methods=["GET", "POST"])
+def add_dnd_greeting():
+    """Add Do Not Disturb greeting if it doesn't exist"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Check if DND greeting already exists
+        cursor.execute("SELECT id FROM greetings WHERE type = 'dnd' LIMIT 1")
+        existing = cursor.fetchone()
+
+        if existing:
+            conn.close()
+            return jsonify(
+                {"message": "DND greeting already exists", "id": existing["id"]}
+            )
+
+        # Add DND greeting
+        cursor.execute(
+            """
+            INSERT INTO greetings (type, name, auto_sms_message, audio_url, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            RETURNING id
+        """,
+            (
+                "dnd",
+                "Do Not Disturb",
+                "Smart DND mode - uses open/closed SMS based on hours",
+                "https://softphone.pc-reps.com/new_dnd.mp3",
+                0,
+            ),
+        )
+
+        dnd_id = cursor.fetchone()["id"]
+        conn.commit()
+        conn.close()
+
+        return jsonify({"message": "DND greeting added", "id": dnd_id})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+## REMOVED: /api/call-history was a duplicate of /api/calls
+## All call history now served by GET /api/calls with pagination
+
+
+@app.route("/api/settings/dnd", methods=["GET", "POST"])
+def dnd_setting():
+    """Get or set DND status"""
+    try:
+        if request.method == "GET":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = 'dnd_enabled'"
+            )
+            row = cur.fetchone()
+            conn.close()
+
+            dnd_enabled = bool(int(row["setting_value"])) if row else False
+            return jsonify({"dnd_enabled": dnd_enabled})
+
+        elif request.method == "POST":
+            data = request.get_json()
+            dnd_enabled = data.get("dnd_enabled", False)
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('dnd_enabled', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+            """,
+                (str(int(dnd_enabled)), str(int(dnd_enabled))),
+            )
+            conn.commit()
+            conn.close()
+
+            return jsonify({"status": "success", "dnd_enabled": dnd_enabled})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/auto-sms-templates", methods=["GET", "POST"])
+def auto_sms_templates():
+    """Get or update auto-SMS message templates for open/closed hours"""
+    try:
+        if request.method == "GET":
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            # Get open hours template
+            cur.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_open_message'"
+            )
+            open_row = cur.fetchone()
+
+            # Get closed hours template
+            cur.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_closed_message'"
+            )
+            closed_row = cur.fetchone()
+            conn.close()
+
+            # Default messages if not set
+            default_open = "Hi, this is PC Reps 👋 For the fastest response, just reply to this text with your question. Hours: Tue, Thu, Sat 10–6. Walk-ins welcome. Reply STOP to opt out."
+            default_closed = "Hi, this is PC Reps 👋 We're currently closed (open Tue, Thu, Sat 10–6). For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
+
+            return jsonify(
+                {
+                    "open_message": (
+                        open_row["setting_value"] if open_row else default_open
+                    ),
+                    "closed_message": (
+                        closed_row["setting_value"] if closed_row else default_closed
+                    ),
+                }
+            )
+
+        elif request.method == "POST":
+            data = request.get_json()
+            open_message = data.get("open_message")
+            closed_message = data.get("closed_message")
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            if open_message is not None:
+                cur.execute(
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                    VALUES ('auto_sms_open_message', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                """,
+                    (open_message, open_message),
+                )
+
+            if closed_message is not None:
+                cur.execute(
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                    VALUES ('auto_sms_closed_message', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                """,
+                    (closed_message, closed_message),
+                )
+
+            conn.commit()
+            conn.close()
+
+            return jsonify({"status": "success"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/greetings/remove-dnd", methods=["DELETE"])
+def remove_old_dnd_greeting():
+    """Remove the old DND greeting since we're using toggle now"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM greetings WHERE type = 'dnd'")
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+
+        return jsonify(
+            {
+                "message": f"Removed {deleted_count} old DND greeting(s)",
+                "deleted_count": deleted_count,
+            }
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/contacts/lookup/<phone_number>")
+def lookup_contact(phone_number):
+    """Look up contact name by phone number"""
+    try:
+        from phone_utils import normalize_phone_number
+
+        normalized_phone = normalize_phone_number(phone_number)
+        if not normalized_phone:
+            return jsonify({"error": "Invalid phone number"}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, company FROM contacts WHERE phone_primary = ? OR phone_secondary = ?",
+            (normalized_phone, normalized_phone),
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            name = row["name"]
+            if row["company"]:
+                name += f" ({row['company']})"
+            return jsonify({"name": name})
+        else:
+            return jsonify({"name": None})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/debug", methods=["GET", "POST"])
+def debug_setting():
+    """Get or set debug mode for testing"""
+    try:
+        if request.method == "GET":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = 'debug_mode_enabled'"
+            )
+            row = cur.fetchone()
+            conn.close()
+
+            debug_enabled = bool(int(row["setting_value"])) if row else False
+            return jsonify({"debug_enabled": debug_enabled})
+
+        elif request.method == "POST":
+            data = request.get_json()
+            debug_enabled = data.get("enabled", False)
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                VALUES ('debug_mode_enabled', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+            """,
+                (str(int(debug_enabled)), str(int(debug_enabled))),
+            )
+            conn.commit()
+            conn.close()
+
+            return jsonify({"status": "success", "debug_enabled": debug_enabled})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/default-operator", methods=["GET"])
+def get_default_operator():
+    """Get the current default operator user ID"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key = 'default_operator_user_id'"
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return jsonify({"user_id": int(row["setting_value"])})
+        else:
+            return jsonify({"user_id": None})
+    except Exception as e:
+        print(f"Error getting default operator: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/default-operator", methods=["POST"])
+def set_default_operator():
+    """Set the default operator user ID"""
+    try:
+        data = request.get_json()
+        user_id = data.get("user_id")
+
+        if not user_id:
+            return jsonify({"error": "Missing user_id"}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO app_settings (setting_key, setting_value, updated_at)
+            VALUES ('default_operator_user_id', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+        """,
+            (str(user_id), str(user_id)),
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": "success", "user_id": user_id})
+    except Exception as e:
+        print(f"Error setting default operator: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/business-hours", methods=["GET", "POST"])
+def business_hours():
+    """Get or set business hours"""
+    try:
+        if request.method == "GET":
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            # Get all business hour settings
+            cur.execute(
+                """
+                SELECT setting_key, setting_value FROM app_settings 
+                WHERE setting_key IN ('business_open_time', 'business_close_time', 'business_days')
+            """
+            )
+            rows = cur.fetchall()
+            conn.close()
+
+            settings = {
+                "open_time": "10:00",  # Default: 10am
+                "close_time": "18:00",  # Default: 6pm
+                "days": "2,4,6",  # Default: Tue, Thu, Sat
+            }
+
+            for row in rows:
+                if row["setting_key"] == "business_open_time":
+                    settings["open_time"] = row["setting_value"]
+                elif row["setting_key"] == "business_close_time":
+                    settings["close_time"] = row["setting_value"]
+                elif row["setting_key"] == "business_days":
+                    settings["days"] = row["setting_value"]
+
+            return jsonify(settings)
+
+        elif request.method == "POST":
+            data = request.get_json()
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            if "open_time" in data:
+                cur.execute(
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                    VALUES ('business_open_time', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                """,
+                    (data["open_time"], data["open_time"]),
+                )
+
+            if "close_time" in data:
+                cur.execute(
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                    VALUES ('business_close_time', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                """,
+                    (data["close_time"], data["close_time"]),
+                )
+
+            if "days" in data:
+                cur.execute(
+                    """
+                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                    VALUES ('business_days', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                """,
+                    (data["days"], data["days"]),
+                )
+
+            conn.commit()
+            conn.close()
+
+            return jsonify({"status": "success"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def run_startup_migrations():
+    """Run safe migrations on startup — adds missing columns if needed"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Add 'seen' column to call_log if it doesn't exist
+        cur.execute("""
+            ALTER TABLE call_log ADD COLUMN IF NOT EXISTS seen BOOLEAN DEFAULT false
+        """)
+        conn.commit()
+        conn.close()
+        print("✅ Startup migrations complete")
+    except Exception as e:
+        print(f"⚠️ Startup migration note: {e}")
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    print("=" * 60)
+    print("🚀 PC Reps Softphone Server Starting...")
+    print("=" * 60)
+    print(f"🐘 Database: PostgreSQL (softphone)")
+    print(f"🌐 Server URL: http://0.0.0.0:10000")
+    print(f"🔌 WebSocket: Enabled")
+    print("=" * 60)
+    run_startup_migrations()
+    socketio.run(app, host="0.0.0.0", port=10000, debug=True)
