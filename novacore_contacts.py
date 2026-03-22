@@ -205,6 +205,67 @@ def find_customer_by_phone(phone_number):
         conn.close()
 
 
+def bulk_resolve_names(phone_numbers):
+    """
+    Resolve a list of phone numbers to display names in a single query.
+    Returns a dict of {normalized_phone: display_name}.
+    """
+    if not phone_numbers:
+        return {}
+
+    # Normalize all numbers to 10-digit
+    digit_to_original = {}
+    for pn in phone_numbers:
+        digits = _strip_to_digits(pn)
+        if digits:
+            digit_to_original[digits] = pn
+
+    if not digit_to_original:
+        return {}
+
+    digit_list = list(digit_to_original.keys())
+
+    conn = get_novacore_connection()
+    try:
+        cursor = conn.cursor()
+
+        # Build a single query that checks all phone columns against all numbers
+        placeholders = ",".join(["%s"] * len(digit_list))
+        conditions = []
+        for col in _PHONE_COLUMNS:
+            conditions.append(f"{_PHONE_NORM_SQL.format(col=col)} IN ({placeholders})")
+
+        query = f"""
+            SELECT id, first_name, last_name, business_name,
+                   phone, mobile_phone, home_phone, office_phone, other_phone, mobile
+            FROM customers
+            WHERE disabled IS NOT TRUE
+              AND ({' OR '.join(conditions)})
+        """
+        # Each condition needs the full digit_list
+        params = digit_list * len(_PHONE_COLUMNS)
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        # Build result mapping: for each customer row, figure out which
+        # of our input numbers it matches
+        result = {}
+        for row in rows:
+            name = _build_display_name(row)
+            if not name:
+                continue
+            # Check which of our search digits match this customer
+            for col in _PHONE_COLUMNS:
+                col_digits = _strip_to_digits(row.get(col))
+                if col_digits and col_digits in digit_to_original:
+                    original_phone = digit_to_original[col_digits]
+                    result[original_phone] = name
+
+        return result
+    finally:
+        conn.close()
+
+
 def get_contact_name(phone_number):
     """
     Resolve a phone number to a display name via NovaCore.

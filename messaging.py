@@ -1459,8 +1459,7 @@ def get_message_threads():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Single query using CTEs to get everything at once
-        # Old code ran 5 queries PER thread (N+1 pattern)
+        # Get threads with flags from local DB, then resolve names via NovaCore
         cur.execute("""
             WITH latest_messages AS (
                 SELECT
@@ -1487,18 +1486,6 @@ def get_message_threads():
                     ROW_NUMBER() OVER (PARTITION BY phone_number ORDER BY timestamp DESC) as rn
                 FROM messages
                 WHERE direction = 'outbound'
-            ),
-            contact_flags AS (
-                SELECT DISTINCT ON (COALESCE(c.phone_primary, c.phone_secondary))
-                    c.phone_primary,
-                    c.phone_secondary,
-                    NULLIF(c.name, 'Unknown Contact') as contact_name,
-                    c.flag_type_id,
-                    ft.id as flag_id,
-                    ft.name as flag_name,
-                    ft.color as flag_color
-                FROM contacts c
-                LEFT JOIN flag_types ft ON c.flag_type_id = ft.id
             )
             SELECT
                 lm.phone_number,
@@ -1508,20 +1495,27 @@ def get_message_threads():
                 COALESCE(uc.unread_count, 0) as unread_count,
                 ol.status as last_outbound_status,
                 ol.status_reason as last_outbound_status_reason,
-                cf.contact_name,
                 cf.flag_type_id,
-                cf.flag_id,
-                cf.flag_name,
-                cf.flag_color
+                ft.id as flag_id,
+                ft.name as flag_name,
+                ft.color as flag_color
             FROM latest_messages lm
             LEFT JOIN unread_counts uc ON lm.phone_number = uc.phone_number
             LEFT JOIN outbound_latest ol ON lm.phone_number = ol.phone_number AND ol.rn = 1
-            LEFT JOIN contact_flags cf ON (cf.phone_primary = lm.phone_number OR cf.phone_secondary = lm.phone_number)
+            LEFT JOIN contact_flags cf ON cf.phone_number = lm.phone_number
+            LEFT JOIN flag_types ft ON cf.flag_type_id = ft.id
             WHERE lm.rn = 1
             ORDER BY lm.timestamp DESC
         """)
 
         rows = cur.fetchall()
+        conn.close()
+
+        # Resolve all contact names from NovaCore in one query
+        from novacore_contacts import bulk_resolve_names
+        phone_numbers = [row["phone_number"] for row in rows]
+        name_map = bulk_resolve_names(phone_numbers)
+
         threads = []
         for row in rows:
             flag_type = None
@@ -1538,14 +1532,13 @@ def get_message_threads():
                 "latest_message": row["latest_message"],
                 "latest_direction": row["latest_direction"],
                 "unread_count": int(row["unread_count"]),
-                "contact_name": row["contact_name"],
+                "contact_name": name_map.get(row["phone_number"]),
                 "last_outbound_status": row["last_outbound_status"],
                 "last_outbound_status_reason": row["last_outbound_status_reason"],
                 "is_flagged": flag_type is not None,
                 "flag_type": flag_type,
             })
 
-        conn.close()
         return jsonify(threads)
     except Exception as e:
         print("❌ Error fetching threads:", e)

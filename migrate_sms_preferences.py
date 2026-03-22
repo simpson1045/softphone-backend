@@ -39,15 +39,15 @@ def migrate():
     cur.execute("""
         INSERT INTO sms_preferences (phone_number, suppress_auto_sms, opted_out_sms, sms_capable, created_at, updated_at)
         SELECT phone_primary,
-               COALESCE(suppress_auto_sms, FALSE),
-               COALESCE(opted_out_sms, FALSE),
-               sms_capable,
+               COALESCE(suppress_auto_sms::boolean, FALSE),
+               COALESCE(opted_out_sms::boolean, FALSE),
+               sms_capable::boolean,
                COALESCE(created_at::timestamp, NOW()),
                COALESCE(updated_at::timestamp, NOW())
         FROM contacts
         WHERE phone_primary IS NOT NULL
           AND phone_primary != ''
-          AND (suppress_auto_sms = TRUE OR opted_out_sms = TRUE OR sms_capable IS NOT NULL)
+          AND (suppress_auto_sms IS NOT NULL OR opted_out_sms IS NOT NULL OR sms_capable IS NOT NULL)
         ON CONFLICT (phone_number) DO UPDATE SET
             suppress_auto_sms = EXCLUDED.suppress_auto_sms,
             opted_out_sms = EXCLUDED.opted_out_sms,
@@ -68,6 +68,7 @@ def migrate():
         WHERE phone_primary IS NOT NULL
           AND phone_primary != ''
           AND flag_type_id IS NOT NULL
+          AND flag_type_id IN (SELECT id FROM flag_types)
         ON CONFLICT (phone_number) DO UPDATE SET
             flag_type_id = EXCLUDED.flag_type_id,
             updated_at = NOW()
