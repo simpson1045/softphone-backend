@@ -479,16 +479,11 @@ def log_outbound_call():
             print("❌ Invalid phone number")
             return jsonify({"error": "Invalid phone number"}), 400
 
-        # Get contact name
-        contact_name = None
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM contacts WHERE phone_primary = ? OR phone_secondary = ?",
-            (normalized_phone, normalized_phone),
-        )
-        row = cursor.fetchone()
-        contact_name = row["name"] if row else None
+        # Get contact name from NovaCore
+        from novacore_contacts import get_contact_name as nc_get_name
+        contact_name = nc_get_name(normalized_phone)
+
+        conn = get_db_connection()  # still needed for call_log insert below
 
         print(f"👤 Contact name: {contact_name}")
         print("✅ About to insert into database")
@@ -2147,19 +2142,13 @@ def lookup_contact(phone_number):
         if not normalized_phone:
             return jsonify({"error": "Invalid phone number"}), 400
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name, company FROM contacts WHERE phone_primary = ? OR phone_secondary = ?",
-            (normalized_phone, normalized_phone),
-        )
-        row = cursor.fetchone()
-        conn.close()
+        from novacore_contacts import find_customer_by_phone
+        customer = find_customer_by_phone(normalized_phone)
 
-        if row:
-            name = row["name"]
-            if row["company"]:
-                name += f" ({row['company']})"
+        if customer:
+            name = customer.get("name") or ""
+            if customer.get("company"):
+                name += f" ({customer['company']})"
             return jsonify({"name": name})
         else:
             return jsonify({"name": None})

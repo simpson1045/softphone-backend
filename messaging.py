@@ -65,8 +65,9 @@ def notify_novacore_ticket(phone_number, direction, comm_type, body="", staff_us
         if staff_user_id:
             payload["staff_user_id"] = staff_user_id
 
+        novacore_url = os.getenv("NOVACORE_URL", "http://pcreps:5000")
         resp = requests.post(
-            "http://localhost:5000/api/ticket-comms/event",
+            f"{novacore_url}/api/ticket-comms/event",
             json=payload,
             headers={"Content-Type": "application/json", "X-API-Key": api_key},
             timeout=5,
@@ -110,42 +111,18 @@ def handle_stop_start_messages(phone_number, message_body):
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # First, try to find existing contact
+            # Upsert into sms_preferences table
             cur.execute(
                 """
-                SELECT id FROM contacts 
-                WHERE phone_primary = %s OR phone_secondary = %s
-            """,
-                (normalized_phone, normalized_phone),
+                INSERT INTO sms_preferences (phone_number, opted_out_sms, created_at, updated_at)
+                VALUES (%s, TRUE, NOW(), NOW())
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    opted_out_sms = TRUE,
+                    updated_at = NOW()
+                """,
+                (normalized_phone,),
             )
-
-            contact = cur.fetchone()
-
-            if contact:
-                # Update existing contact
-                cur.execute(
-                    """
-                    UPDATE contacts 
-                    SET opted_out_sms = 1, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                """,
-                    (contact["id"],),
-                )
-                print(
-                    f"✅ Updated existing contact opt-out status for {normalized_phone}"
-                )
-            else:
-                # Create new contact record for opt-out tracking
-                cur.execute(
-                    """
-                    INSERT INTO contacts (phone_primary, name, opted_out_sms, created_at, updated_at)
-                    VALUES (%s, NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                    (normalized_phone,),
-                )
-                print(
-                    f"✅ Created new contact record with opt-out for {normalized_phone}"
-                )
+            print(f"✅ Set opted_out_sms=TRUE in sms_preferences for {normalized_phone}")
 
             conn.commit()
             conn.close()
@@ -195,40 +172,18 @@ def handle_stop_start_messages(phone_number, message_body):
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # Find existing contact
+            # Upsert into sms_preferences table
             cur.execute(
                 """
-                SELECT id FROM contacts 
-                WHERE phone_primary = %s OR phone_secondary = %s
-            """,
-                (normalized_phone, normalized_phone),
+                INSERT INTO sms_preferences (phone_number, opted_out_sms, created_at, updated_at)
+                VALUES (%s, FALSE, NOW(), NOW())
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    opted_out_sms = FALSE,
+                    updated_at = NOW()
+                """,
+                (normalized_phone,),
             )
-
-            contact = cur.fetchone()
-
-            if contact:
-                # Update existing contact
-                cur.execute(
-                    """
-                    UPDATE contacts 
-                    SET opted_out_sms = 0, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                """,
-                    (contact["id"],),
-                )
-                print(f"✅ Updated contact opt-in status for {normalized_phone}")
-            else:
-                # Create new contact record with opt-in
-                cur.execute(
-                    """
-                    INSERT INTO contacts (phone_primary, name, opted_out_sms, created_at, updated_at)
-                    VALUES (%s, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                    (normalized_phone,),
-                )
-                print(
-                    f"✅ Created new contact record with opt-in for {normalized_phone}"
-                )
+            print(f"✅ Set opted_out_sms=FALSE in sms_preferences for {normalized_phone}")
 
             conn.commit()
             conn.close()
@@ -429,21 +384,18 @@ def send_closed_day_text_reply(phone_number):
             )
             return False
 
-        # Check if user has opted out
+        # Check if user has opted out (via sms_preferences table)
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT opted_out_sms, suppress_auto_sms FROM contacts 
-            WHERE phone_primary = %s OR phone_secondary = %s
-        """,
-            (normalized_phone, normalized_phone),
+            "SELECT opted_out_sms, suppress_auto_sms FROM sms_preferences WHERE phone_number = %s",
+            (normalized_phone,),
         )
 
-        contact = cur.fetchone()
+        pref = cur.fetchone()
         conn.close()
 
-        if contact and (contact["opted_out_sms"] or contact["suppress_auto_sms"]):
+        if pref and (pref["opted_out_sms"] or pref["suppress_auto_sms"]):
             print(
                 f"🚫 Closed-day text auto-reply suppressed for {normalized_phone} (opted out)"
             )
@@ -1415,53 +1367,15 @@ def search_messages():
 
 @messaging_bp.route("/contacts/search", methods=["GET"])
 def search_contacts():
+    """Search customers via NovaCore."""
     try:
+        from novacore_contacts import search_customers as nc_search
         query = request.args.get("q", "").strip()
         if not query:
             return jsonify([])
 
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Build search query for master database structure
-        search_conditions = []
-        params = []
-
-        # Search name
-        search_conditions.append("name ILIKE %s")
-        params.append(f"%{query}%")
-
-        # Search primary and secondary phone numbers
-        search_conditions.append(
-            "REPLACE(REPLACE(phone_primary, '+1', ''), '+', '') LIKE %s"
-        )
-        params.append(f"%{query.replace('+1', '').replace('+', '')}%")
-
-        search_conditions.append(
-            "REPLACE(REPLACE(phone_secondary, '+1', ''), '+', '') LIKE %s"
-        )
-        params.append(f"%{query.replace('+1', '').replace('+', '')}%")
-
-        # Search company if available
-        search_conditions.append("company ILIKE %s")
-        params.append(f"%{query}%")
-
-        # Execute search
-        search_query = f"""
-            SELECT * FROM contacts 
-            WHERE {' OR '.join(search_conditions)}
-            ORDER BY name ASC
-            LIMIT 20
-        """
-
-        cur.execute(search_query, params)
-        contacts = []
-        for row in cur.fetchall():
-            contact = dict(row)
-            contacts.append(contact)
-
-        conn.close()
-        return jsonify(contacts)
+        results = nc_search(query)
+        return jsonify(results)
 
     except Exception as e:
         print(f"❌ Error searching contacts: {e}")
@@ -1470,8 +1384,10 @@ def search_contacts():
 
 @messaging_bp.route("/contacts/recent", methods=["GET"])
 def get_recent_contacts():
+    """Get recent contacts by looking up message threads against NovaCore."""
     try:
-        # Get recent contacts from message threads
+        from novacore_contacts import find_customer_by_phone
+
         conn = get_db_connection()
         cur = conn.cursor()
 
@@ -1479,35 +1395,23 @@ def get_recent_contacts():
         cur.execute(
             """
             SELECT DISTINCT phone_number, MAX(timestamp) as last_contact
-            FROM messages 
-            GROUP BY phone_number 
+            FROM messages
+            GROUP BY phone_number
             ORDER BY last_contact DESC
             LIMIT 10
         """
         )
 
         recent_numbers = [row["phone_number"] for row in cur.fetchall()]
-
-        # Look up contact details for these numbers
-        recent_contacts = []
-
-        for phone_number in recent_numbers:
-            # Search for this contact using normalized phone numbers
-            cur.execute(
-                """
-                SELECT * FROM contacts 
-                WHERE phone_primary = %s OR phone_secondary = %s
-                LIMIT 1
-            """,
-                (phone_number, phone_number),
-            )
-
-            row = cur.fetchone()
-            if row:
-                contact = dict(row)
-                recent_contacts.append(contact)
-
         conn.close()
+
+        # Look up contact details from NovaCore
+        recent_contacts = []
+        for phone_number in recent_numbers:
+            customer = find_customer_by_phone(phone_number)
+            if customer:
+                recent_contacts.append(customer)
+
         return jsonify(recent_contacts)
 
     except Exception as e:
@@ -1652,7 +1556,7 @@ def get_message_threads():
 
 @messaging_bp.route("/contacts/toggle-flag/<phone_number>", methods=["POST"])
 def toggle_contact_flag(phone_number):
-    """Set or remove a flag on a contact. Pass flag_type_id to set, null/omit to remove."""
+    """Set or remove a flag on a contact via contact_flags table."""
     try:
         normalized_phone = normalize_phone_number(phone_number)
         if not normalized_phone:
@@ -1664,36 +1568,23 @@ def toggle_contact_flag(phone_number):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Find existing contact
-        cur.execute(
-            """
-            SELECT id, flag_type_id FROM contacts 
-            WHERE phone_primary = %s OR phone_secondary = %s
-            LIMIT 1
-            """,
-            (normalized_phone, normalized_phone),
-        )
-
-        contact = cur.fetchone()
-
-        if contact:
-            # Update existing contact's flag
+        if flag_type_id is not None:
+            # Set or update flag
             cur.execute(
                 """
-                UPDATE contacts 
-                SET flag_type_id = %s, updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
+                INSERT INTO contact_flags (phone_number, flag_type_id, created_at, updated_at)
+                VALUES (%s, %s, NOW(), NOW())
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    flag_type_id = %s,
+                    updated_at = NOW()
                 """,
-                (flag_type_id, contact["id"]),
+                (normalized_phone, flag_type_id, flag_type_id),
             )
         else:
-            # Create new contact record with flag
+            # Remove flag
             cur.execute(
-                """
-                INSERT INTO contacts (phone_primary, name, flag_type_id, created_at, updated_at)
-                VALUES (%s, NULL, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                (normalized_phone, flag_type_id),
+                "DELETE FROM contact_flags WHERE phone_number = %s",
+                (normalized_phone,),
             )
 
         # Get flag type details if flagged
@@ -1720,7 +1611,7 @@ def toggle_contact_flag(phone_number):
 
 @messaging_bp.route("/contacts/get-flag/<phone_number>", methods=["GET"])
 def get_contact_flag(phone_number):
-    """Get flag info for a contact, including flag type details"""
+    """Get flag info for a contact from contact_flags table."""
     try:
         normalized_phone = normalize_phone_number(phone_number)
         if not normalized_phone:
@@ -1730,13 +1621,13 @@ def get_contact_flag(phone_number):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT c.flag_type_id, ft.id, ft.name, ft.color
-            FROM contacts c
-            LEFT JOIN flag_types ft ON c.flag_type_id = ft.id
-            WHERE c.phone_primary = %s OR c.phone_secondary = %s
+            SELECT cf.flag_type_id, ft.id, ft.name, ft.color
+            FROM contact_flags cf
+            LEFT JOIN flag_types ft ON cf.flag_type_id = ft.id
+            WHERE cf.phone_number = %s
             LIMIT 1
             """,
-            (normalized_phone, normalized_phone),
+            (normalized_phone,),
         )
 
         result = cur.fetchone()
@@ -1871,9 +1762,9 @@ def delete_flag_type(flag_type_id):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # First, unflag all contacts using this flag type
+        # First, unflag all contacts using this flag type (in contact_flags table)
         cur.execute(
-            "UPDATE contacts SET flag_type_id = NULL WHERE flag_type_id = %s",
+            "UPDATE contact_flags SET flag_type_id = NULL WHERE flag_type_id = %s",
             (flag_type_id,),
         )
         unflagged_count = cur.rowcount

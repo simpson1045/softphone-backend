@@ -1,253 +1,513 @@
-
-from flask import Blueprint, request, Response, render_template_string, send_file, redirect, url_for
+from flask import Blueprint, request, Response, send_file, redirect, url_for, jsonify
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
+from dotenv import load_dotenv
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 import requests
 import pytz
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from zipfile import ZipFile
-from smbprotocol.connection import Connection
-from smbprotocol.session import Session
-from smbprotocol.tree import TreeConnect
-from smbprotocol.open import Open, CreateOptions, FileAttributes, FilePipePrinterAccessMask, ShareAccess, CreateDisposition
+from dateutil import parser
+import traceback
+import time
+import re
+from faster_whisper import WhisperModel
+import threading
+from database import get_db_connection
+from phone_utils import normalize_phone_number, get_contact_name
+
+load_dotenv()
 
 voicemail_bp = Blueprint("voicemail", __name__)
-VOICEMAIL_FILE = r"\\192.168.1.100\pc-reps\PC Reps\softphone\voicemails\voicemails.json"
-RECORDINGS_DIR = "recordings"
+RECORDINGS_DIR = os.path.join("recordings", "voicemails")
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-SMTP_SERVER = os.getenv("SMTP_SERVER")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
-EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")
-
-FILESHARE_USER = "Administrator"
-FILESHARE_PASS = "Computerrepair2019@"
-FILESHARE_PATH = r"\\192.168.1.100\pc-reps\PC Reps\softphone\voicemails"
-
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+# Ensure recordings directory exists
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
-if not os.path.exists(VOICEMAIL_FILE):
-    with open(VOICEMAIL_FILE, "w") as f:
-        json.dump([], f)
 
-@voicemail_bp.route("/call/incoming", methods=["POST"])
-def handle_incoming_call():
-    resp = VoiceResponse()
-    pst = pytz.timezone("America/Los_Angeles")
-    now = datetime.now(pst)
-    hour = now.hour
-    weekday = now.weekday()
-    if 10 <= hour < 18 and 1 <= weekday <= 5:
-        resp.play("/static/open_greeting.mp3")
-        resp.pause(length=1)
-    else:
-        resp.play("/static/closed_greeting.mp3")
-    resp.record(
-        max_length=60,
-        timeout=10,
-        play_beep=True,
-        transcribe=True,
-        transcribe_callback="/voicemail/save"
-    )
-    resp.hangup()
-    return Response(str(resp), status=200, mimetype="text/xml")
+
+
+# normalize_phone_number and get_contact_name imported from phone_utils
+
+
+def update_voicemail_notification_count():
+    """Update the localStorage notification count for new voicemails"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0")
+        row = cur.fetchone()
+        unread_count = row["cnt"] if row else 0
+        conn.close()
+
+        print(f"Unread voicemails: {unread_count}")
+        return unread_count
+    except Exception as e:
+        print(f"Warning: Error updating voicemail count: {e}")
+        return 0
+
+
+
+# Whisper model singleton — loaded once, kept in memory
+# With 160GB RAM and RTX 3090, this should be GPU-accelerated
+_whisper_model = None
+
+
+def _check_cuda_available():
+    """Check if CUDA and cuDNN are properly available before attempting GPU mode.
+
+    The cuDNN check is critical — if cuDNN DLLs are missing, CTranslate2 will crash
+    at the C level (not a Python exception), killing the entire Flask process.
+    """
+    try:
+        import ctypes
+        ctypes.cdll.LoadLibrary("cudnn_ops64_9.dll")
+        ctypes.cdll.LoadLibrary("cudnn_cnn64_9.dll")
+        return True
+    except OSError as e:
+        print(f"⚠️ cuDNN DLLs not found: {e}")
+        return False
+
+
+def _get_whisper_model():
+    """Get or create the cached Whisper model (singleton)"""
+    global _whisper_model
+    if _whisper_model is None:
+        if _check_cuda_available():
+            try:
+                _whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+                print("🎤 Whisper model loaded (GPU - CUDA float16)")
+            except Exception as e:
+                print(f"⚠️ GPU Whisper failed ({e}), falling back to CPU")
+                _whisper_model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+                print("🎤 Whisper model loaded (CPU - int8 fallback)")
+        else:
+            print("⚠️ cuDNN not available, using CPU for Whisper")
+            _whisper_model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+            print("🎤 Whisper model loaded (CPU - int8 fallback)")
+    return _whisper_model
+
+
+def transcribe_with_whisper(audio_file_path, voicemail_id):
+    """Transcribe audio file using local Whisper model"""
+    try:
+        print(f"Starting Whisper transcription for voicemail {voicemail_id}")
+
+        model = _get_whisper_model()
+
+        # Transcribe the audio
+        segments, info = model.transcribe(audio_file_path, language="en")
+
+        # Combine all segments into one transcript
+        transcript = " ".join([segment.text.strip() for segment in segments])
+
+        print(f"Whisper transcription complete: {transcript[:100]}...")
+
+        # Update database with new transcription
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE voicemails 
+            SET transcription = ?, whisper_transcribed = 1 
+            WHERE id = ?
+        """,
+            (transcript, voicemail_id),
+        )
+        conn.commit()
+        conn.close()
+
+        print(f"Database updated for voicemail {voicemail_id}")
+
+    except Exception as e:
+        print(f"Whisper transcription failed for voicemail {voicemail_id}: {e}")
+
+
+def format_datetime(value):
+    try:
+        dt = parser.parse(value)
+        return dt.strftime("%B %d, %Y - %I:%M %p")
+    except Exception:
+        return value
+
+
+voicemail_bp.add_app_template_filter(format_datetime)
+
 
 @voicemail_bp.route("/voicemail/save", methods=["POST"])
 def save_voicemail():
+    print("Hit /voicemail/save route")
+    print(f"Incoming form data: {dict(request.form)}")
+
     recording_url = request.form.get("RecordingUrl")
-    recording_sid = recording_url.split("/")[-1] if recording_url else ""
+    recording_sid = request.form.get("RecordingSid") or (
+        recording_url.split("/")[-1] if recording_url else ""
+    )
     from_number = request.form.get("From")
-    transcription = request.form.get("TranscriptionText", "(no transcription)")
+    to_number = request.form.get("To")
+    call_sid = request.form.get("CallSid")
+    transcription = request.form.get("TranscriptionText", "")
+
+    # Get timezone-aware timestamp
     pst = pytz.timezone("America/Los_Angeles")
-    timestamp = datetime.now(pytz.utc).astimezone(pst).strftime('%B %d, %Y — %I:%M %p %Z')
-    local_filename = f"{RECORDINGS_DIR}/{recording_sid}.mp3"
-    r = requests.get(f"{recording_url}.mp3", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-    if r.status_code == 200:
-        with open(local_filename, "wb") as f:
-            f.write(r.content)
-    voicemail = {
-        "from": from_number,
-        "recording_sid": recording_sid,
-        "transcription": transcription,
-        "timestamp": timestamp
-    }
-    with open(VOICEMAIL_FILE, "r+") as f:
-        data = json.load(f)
-        data.append(voicemail)
-        f.seek(0)
-        json.dump(data, f, indent=2)
-    send_email_notification(voicemail)
-    sync_to_file_server(local_filename, recording_sid)
+    timestamp = datetime.now(pytz.utc).astimezone(pst).isoformat()
+
+    local_filename = os.path.join(RECORDINGS_DIR, f"{recording_sid}.mp3")
+
+    print(f"Recording URL: {recording_url}")
+    print(f"Downloading {recording_url} to {local_filename}")
+
+    # Download the recording
+    try:
+        if recording_url:
+            r = requests.get(
+                recording_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+            )
+            print(f"Download status: {r.status_code}")
+            if r.status_code == 200:
+                with open(local_filename, "wb") as f:
+                    f.write(r.content)
+                print("MP3 saved")
+            else:
+                print("MP3 download failed")
+                local_filename = None
+        else:
+            print("No recording URL provided")
+            local_filename = None
+    except Exception as e:
+        print(f"Error downloading MP3: {e}")
+        traceback.print_exc()
+        local_filename = None
+
+    # Normalize phone number and get contact info
+    normalized_phone = normalize_phone_number(from_number)
+    contact_name = get_contact_name(from_number)
+
+    # Store voicemail in master database
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Insert the voicemail record
+        cur.execute(
+            """
+            INSERT INTO voicemails (
+                phone_number, caller_name, recording_sid, recording_url, 
+                local_filename, transcription, call_sid, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+        """,
+            (
+                normalized_phone,
+                contact_name,
+                recording_sid,
+                recording_url,
+                local_filename,
+                transcription,
+                call_sid,
+                timestamp,
+            ),
+        )
+
+        result = cur.fetchone()
+        voicemail_id = result["id"] if result else None
+        conn.commit()
+        conn.close()
+        print("Voicemail saved to database")
+
+        # Start Whisper transcription if audio file exists
+        if voicemail_id and local_filename and os.path.exists(local_filename):
+            thread = threading.Thread(
+                target=transcribe_with_whisper, args=(local_filename, voicemail_id)
+            )
+            thread.daemon = True
+            thread.start()
+            print("Started Whisper transcription in background")
+
+        # Update notification count and emit real-time update
+        unread_count = update_voicemail_notification_count()
+        try:
+            from flask import current_app
+
+            socketio = current_app.extensions.get("socketio")
+            if socketio:
+                socketio.emit(
+                    "voicemail_notification_update", {"unread_count": unread_count}
+                )
+                print(f"Emitted voicemail notification update: {unread_count}")
+        except Exception as e:
+            print(f"Error emitting voicemail notification: {e}")
+
+    except Exception as e:
+        print(f"Failed to save voicemail to database: {e}")
+        traceback.print_exc()
+
     return ("", 204)
 
-def send_email_notification(entry):
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"New Voicemail from {entry['from']}"
-        msg["From"] = EMAIL_USERNAME
-        msg["To"] = NOTIFY_EMAIL_TO
-        body = f"""
-        <p><strong>From:</strong> {entry['from']}</p>
-        <p><strong>Time:</strong> {entry['timestamp']}</p>
-        <p><strong>Transcription:</strong> {entry['transcription']}</p>
-        <p><strong>Recording:</strong> <a href="https://softphone-backend.onrender.com/recording/{entry['recording_sid']}.mp3">Listen</a></p>
-        """
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
-            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USERNAME, NOTIFY_EMAIL_TO, msg.as_string())
-    except Exception as e:
-        print(f"Failed to send email: {e}", flush=True)
 
-def sync_to_file_server(local_path, sid):
-    try:
-        conn = Connection(uuid="", username=FILESHARE_USER, password=FILESHARE_PASS, server="192.168.1.100")
-        conn.connect()
-        session = Session(conn, FILESHARE_USER, FILESHARE_PASS)
-        session.connect()
-        tree = TreeConnect(session, FILESHARE_PATH)
-        tree.connect()
-        share_file = Open(tree, f"{sid}.mp3", access=FilePipePrinterAccessMask.GENERIC_WRITE,
-                          options=CreateOptions.FILE_NON_DIRECTORY_FILE,
-                          attributes=FileAttributes.ARCHIVE,
-                          share=ShareAccess.FILE_SHARE_WRITE,
-                          disposition=CreateDisposition.FILE_OVERWRITE_IF)
-        share_file.create()
-        with open(local_path, "rb") as f:
-            share_file.write(f.read(), 0)
-        share_file.close()
-    except Exception as e:
-        print(f"Failed to sync voicemail to file share: {e}", flush=True)
+@voicemail_bp.route("/recording/complete", methods=["POST"])
+def recording_complete():
+    """Handle recording completion callback"""
+    print("Hit /recording/complete route")
+    print(f"Recording complete data: {dict(request.form)}")
 
-@voicemail_bp.route("/voicemails", methods=["GET"])
-def list_voicemails():
-    with open(VOICEMAIL_FILE, "r") as f:
-        data = json.load(f)
-    html = '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Voicemail Log</title>
-        <link href="https://fonts.googleapis.com/css2?family=Audiowide&display=swap" rel="stylesheet">
-        <style>
-            body {
-                font-family: 'Audiowide', cursive;
-                background: linear-gradient(135deg, #0b0c2a, #1b1c4d);
-                color: #ffffff;
-                padding: 40px;
-            }
-            h1 {
-                text-align: center;
-                font-size: 36px;
-                margin-bottom: 20px;
-                color: #00ffff;
-            }
-            .logo {
-                display: block;
-                margin: 0 auto 30px auto;
-                max-width: 300px;
-            }
-            .voicemail {
-                background-color: rgba(255, 255, 255, 0.05);
-                padding: 20px;
-                border-radius: 10px;
-                margin-bottom: 25px;
-                box-shadow: 0 0 15px rgba(0,255,255,0.3);
-            }
-            .voicemail audio {
-                width: 100%;
-                margin-top: 10px;
-            }
-            .label {
-                color: #00ffff;
-            }
-            .value {
-                color: #ffffff;
-            }
-            .delete-btn {
-                margin-top: 10px;
-                background: red;
-                color: white;
-                border: none;
-                padding: 6px 10px;
-                border-radius: 6px;
-                cursor: pointer;
-            }
-            .download-all {
-                display: block;
-                width: 200px;
-                margin: 0 auto 40px auto;
-                background: #00ffff;
-                color: #000;
-                padding: 10px;
-                text-align: center;
-                border-radius: 10px;
-                text-decoration: none;
-                font-weight: bold;
-            }
-        </style>
-    </head>
-    <body>
-        <img src="/static/logo4_blue&white.png" alt="PC Reps Logo" class="logo">
-        <h1>📡 Incoming Voicemails</h1>
-        <a class="download-all" href="/voicemails/download-all">⬇ Download All Voicemails</a>
-        {% for vm in voicemails %}
-            <div class="voicemail">
-                <div><span class="label">From:</span> <span class="value">{{ vm.from }}</span></div>
-                <div><span class="label">Time:</span> <span class="value">{{ vm.timestamp }}</span></div>
-                <div><span class="label">Recording:</span><br>
-                    <audio controls>
-                        <source src="/recording/{{ vm.recording_sid }}.mp3" type="audio/mpeg">
-                    </audio>
-                </div>
-                <div><span class="label">Transcription:</span> <span class="value">{{ vm.transcription }}</span></div>
-                <form method="POST" action="/voicemail/delete/{{ vm.recording_sid }}">
-                    <button class="delete-btn" onclick="return confirm('Delete this voicemail?')">🗑️ Delete</button>
-                </form>
-            </div>
-        {% endfor %}
-    </body>
-    </html>
-    '''
-    return render_template_string(html, voicemails=data)
+    recording_sid = request.form.get("RecordingSid")
+    recording_url = request.form.get("RecordingUrl")
+    recording_status = request.form.get("RecordingStatus")
+    recording_duration = request.form.get("RecordingDuration", "0")
+
+    print(f"Recording {recording_sid} completed with status: {recording_status}")
+    print(f"Duration: {recording_duration} seconds")
+
+    # Update the voicemail record if needed
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE voicemails 
+            SET recording_url = ?, transcription = COALESCE(transcription, 'Processing transcription...')
+            WHERE recording_sid = ?
+        """,
+            (recording_url, recording_sid),
+        )
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        print(f"Error updating voicemail record: {e}")
+
+    return ("", 204)
+
+
+@voicemail_bp.route("/voicemails/api", methods=["GET"])
+def get_voicemails_json():
+    """Get voicemails from master database with optional pagination.
+
+    Query params:
+        page (int): Page number, default 1
+        per_page (int): Items per page, default 50, max 200
+        If no page param is provided, returns all (backward compatible).
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        page = request.args.get("page", type=int)
+        per_page = request.args.get("per_page", 50, type=int)
+        per_page = min(per_page, 200)
+
+        if page:
+            # Paginated mode
+            offset = (page - 1) * per_page
+
+            cur.execute("SELECT COUNT(*) as total FROM voicemails")
+            total = cur.fetchone()["total"]
+
+            cur.execute(
+                "SELECT * FROM voicemails ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (per_page, offset),
+            )
+            rows = cur.fetchall()
+            conn.close()
+
+            voicemails = []
+            for row in rows:
+                voicemail = dict(row)
+                voicemail["from"] = voicemail["phone_number"]
+                voicemails.append(voicemail)
+
+            return jsonify({
+                "voicemails": voicemails,
+                "pagination": {
+                    "page": page,
+                    "per_page": per_page,
+                    "total": total,
+                    "pages": (total + per_page - 1) // per_page,
+                },
+            })
+        else:
+            # Non-paginated mode (backward compatible)
+            cur.execute("SELECT * FROM voicemails ORDER BY timestamp DESC")
+            rows = cur.fetchall()
+            conn.close()
+
+            voicemails = []
+            for row in rows:
+                voicemail = dict(row)
+                voicemail["from"] = voicemail["phone_number"]
+                voicemails.append(voicemail)
+
+            return jsonify(voicemails)
+
+    except Exception as e:
+        print(f"Error fetching voicemails: {e}")
+        return jsonify([])
+
 
 @voicemail_bp.route("/recording/<sid>.mp3", methods=["GET"])
 def serve_recording(sid):
-    local_path = f"{RECORDINGS_DIR}/{sid}.mp3"
+    """Serve local recording file"""
+    local_path = os.path.join(RECORDINGS_DIR, f"{sid}.mp3")
     if os.path.exists(local_path):
         return send_file(local_path, mimetype="audio/mpeg", download_name=f"{sid}.mp3")
     else:
+        print(f"Recording not found: {local_path}")
         return f"Recording not found: {sid}", 404
+
 
 @voicemail_bp.route("/voicemail/delete/<sid>", methods=["POST"])
 def delete_voicemail(sid):
-    with open(VOICEMAIL_FILE, "r+") as f:
-        data = json.load(f)
-        data = [vm for vm in data if vm["recording_sid"] != sid]
-        f.seek(0)
-        f.truncate()
-        json.dump(data, f, indent=2)
-    mp3_path = os.path.join(RECORDINGS_DIR, f"{sid}.mp3")
-    if os.path.exists(mp3_path):
-        os.remove(mp3_path)
-    return redirect(url_for("voicemail.list_voicemails"))
+    """Delete voicemail from database and file system"""
+    try:
+        # Remove from database
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM voicemails WHERE recording_sid = ?", (sid,))
+        conn.commit()
+        conn.close()
+
+        # Remove local file
+        mp3_path = os.path.join(RECORDINGS_DIR, f"{sid}.mp3")
+        if os.path.exists(mp3_path):
+            os.remove(mp3_path)
+
+        return jsonify({"status": "deleted"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@voicemail_bp.route("/voicemails/mark-read/<int:voicemail_id>", methods=["POST"])
+def mark_voicemail_read(voicemail_id):
+    """Mark voicemail as read"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE voicemails 
+            SET is_read = 1 
+            WHERE id = ?
+        """,
+            (voicemail_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        # Update notification count
+        unread_count = update_voicemail_notification_count()
+        try:
+            from flask import current_app
+
+            socketio = current_app.extensions.get("socketio")
+            if socketio:
+                socketio.emit(
+                    "voicemail_notification_update", {"unread_count": unread_count}
+                )
+        except Exception as e:
+            print(f"Error emitting voicemail update: {e}")
+
+        return jsonify({"status": "marked_read", "unread_count": unread_count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@voicemail_bp.route("/voicemails/unread-count", methods=["GET"])
+def get_unread_voicemail_count():
+    """Get count of unread voicemails"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0")
+        row = cur.fetchone()
+        count = row["cnt"] if row else 0
+        conn.close()
+        return jsonify({"count": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @voicemail_bp.route("/voicemails/download-all", methods=["GET"])
 def download_all_voicemails():
+    """Download all voicemails as a ZIP file"""
     zip_buffer = BytesIO()
     with ZipFile(zip_buffer, "w") as zipf:
         for file in os.listdir(RECORDINGS_DIR):
             if file.endswith(".mp3"):
                 zipf.write(os.path.join(RECORDINGS_DIR, file), arcname=file)
     zip_buffer.seek(0)
-    return send_file(zip_buffer, mimetype="application/zip", as_attachment=True, download_name="voicemails.zip")
+    return send_file(
+        zip_buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="voicemails.zip",
+    )
+
+
+@voicemail_bp.route("/voicemail/retranscribe/<int:voicemail_id>", methods=["POST"])
+def retranscribe_voicemail(voicemail_id):
+    """Re-transcribe a voicemail using Whisper"""
+    try:
+        # Get voicemail info
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM voicemails WHERE id = ?", (voicemail_id,))
+        voicemail = cur.fetchone()
+        conn.close()
+
+        if not voicemail:
+            return jsonify({"error": "Voicemail not found"}), 404
+
+        if not voicemail["local_filename"] or not os.path.exists(
+            voicemail["local_filename"]
+        ):
+            return jsonify({"error": "Audio file not found"}), 404
+
+        # Start transcription in background thread
+        thread = threading.Thread(
+            target=transcribe_with_whisper,
+            args=(voicemail["local_filename"], voicemail_id),
+        )
+        thread.daemon = True
+        thread.start()
+
+        return jsonify({"status": "transcription_started"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@voicemail_bp.route("/voicemails/stats", methods=["GET"])
+def get_voicemail_stats():
+    """Get voicemail statistics"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Total count
+        cur.execute("SELECT COUNT(*) as cnt FROM voicemails")
+        row = cur.fetchone()
+        total = row["cnt"] if row else 0
+
+        # Unread count
+        cur.execute("SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0")
+        row = cur.fetchone()
+        unread = row["cnt"] if row else 0
+
+        # Recent count (last 7 days)
+        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        cur.execute(
+            "SELECT COUNT(*) as cnt FROM voicemails WHERE timestamp > ?", (week_ago,)
+        )
+        row = cur.fetchone()
+        recent = row["cnt"] if row else 0
+
+        conn.close()
+        return jsonify({"total": total, "unread": unread, "recent": recent})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

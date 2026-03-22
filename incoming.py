@@ -36,7 +36,7 @@ def get_novacore_connection():
 
 
 def should_suppress_auto_sms(phone_number):
-    """Check if auto-SMS should be suppressed for this contact"""
+    """Check if auto-SMS should be suppressed for this contact (reads from sms_preferences table)"""
     try:
         normalized_phone = normalize_phone_number(phone_number)
         if not normalized_phone:
@@ -45,13 +45,12 @@ def should_suppress_auto_sms(phone_number):
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT suppress_auto_sms, opted_out_sms FROM contacts WHERE phone_primary = ? OR phone_secondary = ?",
-            (normalized_phone, normalized_phone),
+            "SELECT suppress_auto_sms, opted_out_sms FROM sms_preferences WHERE phone_number = ?",
+            (normalized_phone,),
         )
         row = cur.fetchone()
         conn.close()
         if row:
-            # Check both manual suppression AND opt-out status
             return bool(row["suppress_auto_sms"]) or bool(row["opted_out_sms"])
         return False
     except Exception as e:
