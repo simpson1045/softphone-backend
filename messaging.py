@@ -85,6 +85,30 @@ REPAIRSHOPR_SMS_FORWARD_URL = os.getenv("REPAIRSHOPR_SMS_FORWARD_URL")
 REPAIRSHOPR_TOKEN = os.getenv("REPAIRSHOPR_TOKEN")
 REPAIRSHOPR_API_KEY = os.getenv("REPAIRSHOPR_API_KEY")
 REPAIRSHOPR_BASE_URL = os.getenv("REPAIRSHOPR_BASE_URL")
+NOVACORE_URL = os.getenv("NOVACORE_URL", "http://pcreps:5000")
+SOFTPHONE_API_KEY = os.getenv("SOFTPHONE_API_KEY", "")
+
+
+def _update_novacore_opt_out(phone_number, opt_out_sms):
+    """Update opt_out_sms on a NovaCore customer via the API."""
+    from novacore_contacts import find_customer_by_phone
+    try:
+        customer = find_customer_by_phone(phone_number)
+        if customer and customer.get("novacore_id"):
+            resp = requests.put(
+                f"{NOVACORE_URL}/api/customers/{customer['novacore_id']}",
+                json={"opt_out_sms": opt_out_sms},
+                headers={"Content-Type": "application/json", "X-API-Key": SOFTPHONE_API_KEY},
+                timeout=5,
+            )
+            if resp.ok:
+                print(f"✅ Updated NovaCore customer {customer['novacore_id']} opt_out_sms={opt_out_sms}")
+            else:
+                print(f"⚠️ NovaCore API returned {resp.status_code} updating opt_out_sms")
+        else:
+            print(f"⚠️ No NovaCore customer found for {phone_number}, opt-out stored locally only")
+    except Exception as e:
+        print(f"⚠️ Failed to update NovaCore opt_out_sms: {e}")
 
 
 
@@ -108,24 +132,8 @@ def handle_stop_start_messages(phone_number, message_body):
     message_clean = message_upper.strip()
     if message_clean in ["STOP", "UNSUBSCRIBE", "QUIT", "END", "CANCEL", "OPTOUT"]:
         try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            # Upsert into sms_preferences table
-            cur.execute(
-                """
-                INSERT INTO sms_preferences (phone_number, opted_out_sms, created_at, updated_at)
-                VALUES (%s, TRUE, NOW(), NOW())
-                ON CONFLICT (phone_number) DO UPDATE SET
-                    opted_out_sms = TRUE,
-                    updated_at = NOW()
-                """,
-                (normalized_phone,),
-            )
-            print(f"✅ Set opted_out_sms=TRUE in sms_preferences for {normalized_phone}")
-
-            conn.commit()
-            conn.close()
+            # Update NovaCore customer opt_out_sms
+            _update_novacore_opt_out(normalized_phone, True)
 
             # Send confirmation reply
             account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -169,24 +177,8 @@ def handle_stop_start_messages(phone_number, message_body):
     # Handle START messages
     elif message_clean in ["START", "SUBSCRIBE", "OPTIN"]:
         try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            # Upsert into sms_preferences table
-            cur.execute(
-                """
-                INSERT INTO sms_preferences (phone_number, opted_out_sms, created_at, updated_at)
-                VALUES (%s, FALSE, NOW(), NOW())
-                ON CONFLICT (phone_number) DO UPDATE SET
-                    opted_out_sms = FALSE,
-                    updated_at = NOW()
-                """,
-                (normalized_phone,),
-            )
-            print(f"✅ Set opted_out_sms=FALSE in sms_preferences for {normalized_phone}")
-
-            conn.commit()
-            conn.close()
+            # Update NovaCore customer opt_out_sms
+            _update_novacore_opt_out(normalized_phone, False)
 
             # Send confirmation reply
             account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -385,20 +377,25 @@ def send_closed_day_text_reply(phone_number):
             return False
 
         # Check if user has opted out (via sms_preferences table)
+        # Check NovaCore for opt_out_sms
+        from novacore_contacts import find_customer_by_phone
+        customer = find_customer_by_phone(normalized_phone)
+        if customer and customer.get("opted_out_sms"):
+            print(f"🚫 Closed-day text suppressed for {normalized_phone} (NovaCore opt_out_sms)")
+            return False
+
+        # Check local suppress_auto_sms flag
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT opted_out_sms, suppress_auto_sms FROM sms_preferences WHERE phone_number = %s",
+            "SELECT suppress_auto_sms FROM sms_preferences WHERE phone_number = %s",
             (normalized_phone,),
         )
-
         pref = cur.fetchone()
         conn.close()
 
-        if pref and (pref["opted_out_sms"] or pref["suppress_auto_sms"]):
-            print(
-                f"🚫 Closed-day text auto-reply suppressed for {normalized_phone} (opted out)"
-            )
+        if pref and pref["suppress_auto_sms"]:
+            print(f"🚫 Closed-day text suppressed for {normalized_phone} (suppress_auto_sms)")
             return False
 
         # Send the closed-day message

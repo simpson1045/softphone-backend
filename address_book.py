@@ -13,10 +13,10 @@ address_book_bp = Blueprint("address_book", __name__)
 print("Address Book reading from NovaCore customers table")
 
 
-def _merge_sms_preferences(contacts):
+def _merge_suppress_flags(contacts):
     """
-    Merge local sms_preferences data into the contact list from NovaCore.
-    Matches on normalized phone digits.
+    Merge local suppress_auto_sms flags into the contact list from NovaCore.
+    opted_out_sms and sms_capable now come directly from NovaCore.
     """
     if not contacts:
         return contacts
@@ -24,33 +24,25 @@ def _merge_sms_preferences(contacts):
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT phone_number, suppress_auto_sms, opted_out_sms, sms_capable FROM sms_preferences")
+        cur.execute("SELECT phone_number, suppress_auto_sms FROM sms_preferences WHERE suppress_auto_sms = TRUE")
         prefs_rows = cur.fetchall()
     finally:
         conn.close()
 
     # Build a lookup keyed by last 10 digits
-    prefs_by_digits = {}
+    suppress_digits = set()
     for row in prefs_rows:
         digits = _strip_to_digits(row["phone_number"])
         if digits:
-            prefs_by_digits[digits] = {
-                "suppress_auto_sms": bool(row["suppress_auto_sms"]),
-                "opted_out_sms": bool(row["opted_out_sms"]),
-                "sms_capable": row["sms_capable"] if row["sms_capable"] is not None else None,
-            }
+            suppress_digits.add(digits)
 
     # Merge into contacts
     for contact in contacts:
         for phone_field in ["phone_primary", "phone_secondary"]:
             digits = _strip_to_digits(contact.get(phone_field))
-            if digits and digits in prefs_by_digits:
-                pref = prefs_by_digits[digits]
-                contact["suppress_auto_sms"] = pref["suppress_auto_sms"]
-                contact["opted_out_sms"] = pref["opted_out_sms"]
-                if pref["sms_capable"] is not None:
-                    contact["sms_capable"] = bool(pref["sms_capable"])
-                break  # First match wins
+            if digits and digits in suppress_digits:
+                contact["suppress_auto_sms"] = True
+                break
 
     return contacts
 
@@ -60,7 +52,7 @@ def get_contacts():
     """Fetch all active customers from NovaCore with local SMS preference overlay."""
     try:
         contacts = fetch_all_customers()
-        contacts = _merge_sms_preferences(contacts)
+        contacts = _merge_suppress_flags(contacts)
         return jsonify(contacts)
     except Exception as e:
         print(f"Error getting contacts from NovaCore: {e}")

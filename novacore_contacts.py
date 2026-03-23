@@ -112,10 +112,10 @@ def _row_to_contact(row):
         "address": _build_address(row),
         "company": (row.get("business_name") or "").strip() or None,
         "notes": (row.get("notes") or "").strip() or None,
-        # SMS preferences will be merged separately from sms_preferences table
+        # opt_out_sms and sms_capable from NovaCore, suppress_auto_sms from local table
         "suppress_auto_sms": False,
-        "opted_out_sms": False,
-        "sms_capable": None,
+        "opted_out_sms": bool(row.get("opt_out_sms")) if row.get("opt_out_sms") is not None else False,
+        "sms_capable": bool(row.get("sms_capable")) if row.get("sms_capable") is not None else None,
     }
 
 
@@ -130,7 +130,8 @@ def fetch_all_customers():
         cursor.execute("""
             SELECT id, first_name, last_name, email,
                    phone, mobile_phone, home_phone, office_phone, other_phone, mobile,
-                   business_name, address, address_2, city, state, zip, notes
+                   business_name, address, address_2, city, state, zip, notes,
+                   opt_out_sms, sms_capable
             FROM customers
             WHERE disabled IS NOT TRUE
             ORDER BY
@@ -172,7 +173,8 @@ def find_customer_by_phone(phone_number):
         query = f"""
             SELECT id, first_name, last_name, email,
                    phone, mobile_phone, home_phone, office_phone, other_phone, mobile,
-                   business_name, address, address_2, city, state, zip, notes
+                   business_name, address, address_2, city, state, zip, notes,
+                   opt_out_sms, sms_capable
             FROM customers
             WHERE disabled IS NOT TRUE
               AND ({' OR '.join(conditions)})
@@ -188,7 +190,8 @@ def find_customer_by_phone(phone_number):
         cursor.execute(f"""
             SELECT c.id, c.first_name, c.last_name, c.email,
                    c.phone, c.mobile_phone, c.home_phone, c.office_phone, c.other_phone, c.mobile,
-                   c.business_name, c.address, c.address_2, c.city, c.state, c.zip, c.notes
+                   c.business_name, c.address, c.address_2, c.city, c.state, c.zip, c.notes,
+                   c.opt_out_sms, c.sms_capable
             FROM phones p
             JOIN customers c ON c.id = p.customer_id
             WHERE c.disabled IS NOT TRUE
@@ -313,7 +316,8 @@ def search_customers(query, limit=20):
         query_sql = f"""
             SELECT id, first_name, last_name, email,
                    phone, mobile_phone, home_phone, office_phone, other_phone, mobile,
-                   business_name, address, address_2, city, state, zip, notes
+                   business_name, address, address_2, city, state, zip, notes,
+                   opt_out_sms, sms_capable
             FROM customers
             WHERE disabled IS NOT TRUE
               AND ({' OR '.join(conditions)})
