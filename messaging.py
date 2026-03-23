@@ -129,47 +129,14 @@ def handle_stop_start_messages(phone_number, message_body):
         return False
 
     # Handle STOP messages
+    # Twilio handles the actual unsubscribe reply and message blocking.
+    # We just update NovaCore so the opt-out status is visible in the UI.
     message_clean = message_upper.strip()
     if message_clean in ["STOP", "UNSUBSCRIBE", "QUIT", "END", "CANCEL", "OPTOUT"]:
         try:
-            # Update NovaCore customer opt_out_sms
             _update_novacore_opt_out(normalized_phone, True)
-
-            # Send confirmation reply
-            account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-            auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-            sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
-
-            if account_sid and auth_token:
-                client = Client(account_sid, auth_token)
-
-                stop_reply = (
-                    "✅ You've been removed from PC Reps auto-SMS for missed calls. "
-                    "You can still text us anytime with questions! Reply START to re-enable auto-SMS."
-                )
-
-                try:
-                    reply_message = client.messages.create(
-                        body=stop_reply,
-                        from_=sms_from_number,
-                        to=normalized_phone,
-                        status_callback="https://softphone.pc-reps.com/messages/status",
-                    )
-
-                    print(
-                        f"📤 STOP confirmation sent to {normalized_phone}: {reply_message.sid}"
-                    )
-
-                    # Log the auto-reply
-                    log_message(
-                        "outbound", normalized_phone, stop_reply, [], reply_message.sid
-                    )
-
-                except Exception as e:
-                    print(f"❌ Error sending STOP confirmation: {e}")
-
+            print(f"🔄 Processed STOP from {normalized_phone} — NovaCore updated, Twilio handles reply")
             return True
-
         except Exception as e:
             print(f"❌ Error handling STOP message from {phone_number}: {e}")
             return False
@@ -177,44 +144,9 @@ def handle_stop_start_messages(phone_number, message_body):
     # Handle START messages
     elif message_clean in ["START", "SUBSCRIBE", "OPTIN"]:
         try:
-            # Update NovaCore customer opt_out_sms
             _update_novacore_opt_out(normalized_phone, False)
-
-            # Send confirmation reply
-            account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-            auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-            sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
-
-            if account_sid and auth_token:
-                client = Client(account_sid, auth_token)
-
-                start_reply = (
-                    "✅ You're now subscribed to PC Reps auto-SMS for missed calls. "
-                    "We'll text you when you call and we can't answer. Reply STOP anytime to opt out."
-                )
-
-                try:
-                    reply_message = client.messages.create(
-                        body=start_reply,
-                        from_=sms_from_number,
-                        to=normalized_phone,
-                        status_callback="https://softphone.pc-reps.com/messages/status",
-                    )
-
-                    print(
-                        f"📤 START confirmation sent to {normalized_phone}: {reply_message.sid}"
-                    )
-
-                    # Log the auto-reply
-                    log_message(
-                        "outbound", normalized_phone, start_reply, [], reply_message.sid
-                    )
-
-                except Exception as e:
-                    print(f"❌ Error sending START confirmation: {e}")
-
+            print(f"🔄 Processed START from {normalized_phone} — NovaCore updated, Twilio handles reply")
             return True
-
         except Exception as e:
             print(f"❌ Error handling START message from {phone_number}: {e}")
             return False
@@ -1077,16 +1009,16 @@ def receive_sms():
     # Notify NovaCore to log this inbound SMS on the customer's ticket
     notify_novacore_ticket(from_number, "inbound", "sms", body=body or "")
 
-    # NEW: Handle STOP/START messages with auto-replies
+    # Handle STOP/START messages — update NovaCore, skip auto-replies
     if handle_stop_start_messages(from_number, body):
         print(f"🔄 Processed STOP/START message from {from_number}")
+    else:
+        # Send status auto-reply for priority greeting types (sick, vacation, holiday)
+        status_reply_sent = send_status_auto_reply(from_number)
 
-    # Send status auto-reply for priority greeting types (sick, vacation, holiday)
-    status_reply_sent = send_status_auto_reply(from_number)
-
-    # Only send closed-day auto-reply if we didn't already send a status reply
-    if not status_reply_sent:
-        send_closed_day_text_reply(from_number)
+        # Only send closed-day auto-reply if we didn't already send a status reply
+        if not status_reply_sent:
+            send_closed_day_text_reply(from_number)
 
     # Emit real-time notification
     try:
