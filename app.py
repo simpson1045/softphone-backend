@@ -2110,6 +2110,92 @@ def auto_sms_templates():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/templates", methods=["GET", "POST"])
+def message_templates_collection():
+    """Shared message templates: list all, or create a new one."""
+    try:
+        if request.method == "GET":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, name, content, category FROM message_templates ORDER BY category, name"
+            )
+            rows = cur.fetchall()
+            conn.close()
+            return jsonify([dict(r) for r in rows])
+
+        data = request.get_json() or {}
+        name = (data.get("name") or "").strip()
+        content = (data.get("content") or "").strip()
+        category = (data.get("category") or "General").strip() or "General"
+
+        if not name or not content:
+            return jsonify({"error": "name and content are required"}), 400
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO message_templates (name, content, category)
+            VALUES (?, ?, ?)
+            RETURNING id, name, content, category
+            """,
+            (name, content, category),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        return jsonify(dict(row)), 201
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/templates/<int:template_id>", methods=["PUT", "DELETE"])
+def message_templates_item(template_id):
+    """Shared message templates: update or delete a specific template."""
+    try:
+        if request.method == "DELETE":
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM message_templates WHERE id = ?", (template_id,))
+            deleted = cur.rowcount
+            conn.commit()
+            conn.close()
+            if deleted == 0:
+                return jsonify({"error": "not found"}), 404
+            return jsonify({"status": "success"})
+
+        data = request.get_json() or {}
+        name = (data.get("name") or "").strip()
+        content = (data.get("content") or "").strip()
+        category = (data.get("category") or "General").strip() or "General"
+
+        if not name or not content:
+            return jsonify({"error": "name and content are required"}), 400
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE message_templates
+               SET name = ?, content = ?, category = ?, updated_at = NOW()
+             WHERE id = ?
+         RETURNING id, name, content, category
+            """,
+            (name, content, category, template_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(dict(row))
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/greetings/remove-dnd", methods=["DELETE"])
 def remove_old_dnd_greeting():
     """Remove the old DND greeting since we're using toggle now"""
@@ -2326,7 +2412,7 @@ def business_hours():
 
 
 def run_startup_migrations():
-    """Run safe migrations on startup — adds missing columns if needed"""
+    """Run safe migrations on startup — adds missing columns/indexes if needed"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -2335,6 +2421,11 @@ def run_startup_migrations():
         cur.execute("""
             ALTER TABLE call_log ADD COLUMN IF NOT EXISTS seen BOOLEAN DEFAULT false
         """)
+
+        # Performance indexes for messages table (used by /messages/threads)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_phone_ts ON messages (phone_number, timestamp DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages (phone_number, direction, read) WHERE direction = 'inbound' AND read = 0")
+
         conn.commit()
         conn.close()
         print("✅ Startup migrations complete")
