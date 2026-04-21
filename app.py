@@ -2360,12 +2360,23 @@ def run_startup_migrations():
 
 
 if __name__ == "__main__":
+    debug_mode = os.getenv("FLASK_DEBUG") == "1"
     print("=" * 60)
     print("🚀 PC Reps Softphone Server Starting...")
     print("=" * 60)
     print(f"🐘 Database: PostgreSQL (softphone)")
     print(f"🌐 Server URL: http://0.0.0.0:10000")
     print(f"🔌 WebSocket: Enabled")
+    print(f"🐞 Debug mode: {'ON (DEV ONLY)' if debug_mode else 'OFF'}")
     print("=" * 60)
     run_startup_migrations()
-    socketio.run(app, host="0.0.0.0", port=10000, debug=True)
+    # allow_unsafe_werkzeug=True is required by flask-socketio 5.x when debug is
+    # off, since the Werkzeug dev server is not a hardened production server.
+    # Full migration to a proper WSGI server happens in SaaS Phase 2 (dockerize).
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=10000,
+        debug=debug_mode,
+        allow_unsafe_werkzeug=True,
+    )
