@@ -11,6 +11,7 @@ import re
 from messaging import log_message
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
+from twilio_security import validate_twilio_request
 
 incoming_bp = Blueprint("incoming", __name__)
 pacific = timezone("US/Pacific")
@@ -592,6 +593,7 @@ def get_default_operator_identity():
 
 
 @incoming_bp.route("/incoming", methods=["POST"])
+@validate_twilio_request
 def incoming():
     from_number = request.values.get("From")
     to_number = request.values.get("To")
@@ -879,6 +881,7 @@ def incoming():
 
 
 @incoming_bp.route("/incoming/dial-status", methods=["POST"])
+@validate_twilio_request
 def dial_status():
     print("📞 /dial-status callback triggered ✅")
     for key, value in request.form.items():
@@ -987,6 +990,7 @@ def dial_status():
 
 
 @incoming_bp.route("/incoming/call-status", methods=["POST"])
+@validate_twilio_request
 def call_status():
     call_sid = request.values.get("CallSid")
     from_number = request.values.get("From", "")

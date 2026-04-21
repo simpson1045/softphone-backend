@@ -26,6 +26,7 @@ from address_book import address_book_bp
 from auth import auth_bp, init_login_manager
 from database import get_db_connection
 from call_recording import call_recording_bp
+from twilio_security import validate_twilio_request
 
 import sys
 
@@ -209,6 +210,7 @@ def voice_token():
 
 
 @app.route("/call/flow", methods=["POST"])
+@validate_twilio_request
 def call_flow():
     response = VoiceResponse()
     to_number = request.values.get("To")
@@ -231,6 +233,7 @@ def call_flow():
 
 
 @app.route("/outbound-notice", methods=["POST"])
+@validate_twilio_request
 def outbound_notice():
     """Plays recording notice to the callee when they answer an outbound call"""
     response = VoiceResponse()

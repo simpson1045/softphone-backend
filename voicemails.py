@@ -17,6 +17,7 @@ from faster_whisper import WhisperModel
 import threading
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
+from twilio_security import validate_twilio_request
 
 load_dotenv()
 
@@ -140,6 +141,7 @@ voicemail_bp.add_app_template_filter(format_datetime)
 
 
 @voicemail_bp.route("/voicemail/save", methods=["POST"])
+@validate_twilio_request
 def save_voicemail():
     print("Hit /voicemail/save route")
     print(f"Incoming form data: {dict(request.form)}")
@@ -251,6 +253,7 @@ def save_voicemail():
 
 
 @voicemail_bp.route("/recording/complete", methods=["POST"])
+@validate_twilio_request
 def recording_complete():
     """Handle recording completion callback"""
     print("Hit /recording/complete route")

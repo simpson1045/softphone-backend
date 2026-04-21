@@ -14,6 +14,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
+from twilio_security import validate_twilio_request
 
 pacific = timezone("US/Pacific")
 messaging_bp = Blueprint("messaging", __name__)
@@ -476,6 +477,7 @@ def log_message(
 
 
 @messaging_bp.route("/messages/status", methods=["POST"])
+@validate_twilio_request
 def message_status_callback():
     try:
         message_sid = request.form.get("MessageSid")
@@ -885,6 +887,7 @@ def external_send_sms():
 
 
 @messaging_bp.route("/messages/incoming", methods=["POST"])
+@validate_twilio_request
 def receive_sms():
     print(f"🔥🔥🔥 SMS WEBHOOK HIT! Time: {datetime.utcnow()}")
     print(f"🔥 RECEIVE SMS FUNCTION CALLED!")
