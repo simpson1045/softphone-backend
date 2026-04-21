@@ -1824,6 +1824,8 @@ def novacore_lookup(phone_number):
     otherwise the customer profile URL. Returns 404 if no customer is found.
     """
     try:
+        from urllib.parse import quote
+
         from novacore_contacts import find_customer_by_phone, get_novacore_connection
 
         public_url = os.getenv(
@@ -1832,7 +1834,9 @@ def novacore_lookup(phone_number):
 
         customer = find_customer_by_phone(phone_number)
         if not customer:
-            return jsonify({"error": "No customer found in NovaCore"}), 404
+            url = f"{public_url}/customers/new?phone={quote(phone_number)}"
+            print(f"🆕 No customer found — opening NovaCore new-customer page with phone pre-filled")
+            return jsonify({"url": url, "type": "new_customer"})
 
         customer_id = customer.get("id")
         if not customer_id:
