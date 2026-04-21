@@ -1816,139 +1816,58 @@ def get_analytics():
 from analytics import log_analytics_event
 
 
-@app.route("/api/repairshopr-lookup/<phone_number>")
-def repairshopr_lookup(phone_number):
-    """Look up RepairShopr URL for a phone number"""
+@app.route("/api/novacore-lookup/<phone_number>")
+def novacore_lookup(phone_number):
+    """Look up NovaCore customer/ticket URL for a phone number.
+
+    Returns the URL to the most recent open ticket if the customer has one,
+    otherwise the customer profile URL. Returns 404 if no customer is found.
+    """
     try:
-        import re
-        import requests
+        from novacore_contacts import find_customer_by_phone, get_novacore_connection
 
-        # Normalize phone number (remove non-digits, keep last 10)
-        normalized_phone = re.sub(r"\D", "", phone_number)[-10:]
+        public_url = os.getenv(
+            "NOVACORE_PUBLIC_URL", "https://novacore.pc-reps.com"
+        ).rstrip("/")
 
-        if not normalized_phone:
-            return jsonify({"error": "Invalid phone number"}), 400
+        customer = find_customer_by_phone(phone_number)
+        if not customer:
+            return jsonify({"error": "No customer found in NovaCore"}), 404
 
-        headers = {"Authorization": f"Bearer {os.getenv('REPAIRSHOPR_API_KEY')}"}
-        base_url = os.getenv("REPAIRSHOPR_BASE_URL")
-
-        if not headers["Authorization"] or not base_url:
-            return jsonify({"error": "RepairShopr API not configured"}), 500
-
-        # Search for customer by phone number
-        search_url = f"{base_url}/customers"
-        params = {"query": normalized_phone}
-
-        print(f"🔍 RepairShopr lookup for: {normalized_phone}")
-        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
-
-        if resp.status_code != 200:
-            print(f"❌ RepairShopr API error: {resp.status_code} - {resp.text}")
-            return jsonify({"error": "RepairShopr API error"}), 500
-
-        data = resp.json()
-        customers = data.get("customers", [])
-
-        if not customers:
-            print(f"📞 No customer found, checking leads...")
-
-            # Search for leads by phone number
-            leads_url = f"{base_url}/leads"
-            leads_params = {"query": normalized_phone}
-
-            leads_resp = requests.get(
-                leads_url, headers=headers, params=leads_params, timeout=10
-            )
-
-            if leads_resp.status_code == 200:
-                leads_data = leads_resp.json()
-                leads = leads_data.get("leads", [])
-
-                if leads:
-                    # Found a lead, open it
-                    lead = leads[0]
-                    lead_id = lead.get("id")
-                    url = f"https://pcreps.repairshopr.com/leads/{lead_id}/convert"
-                    print(f"🎯 Found lead: {lead_id}")
-                    return jsonify({"url": url, "type": "lead", "lead_id": lead_id})
-
-            # No customer or lead found
-            return jsonify({"error": "No customer or lead found in RepairShopr"}), 404
-
-        customer = customers[0]
         customer_id = customer.get("id")
+        if not customer_id:
+            return jsonify({"error": "NovaCore customer has no id"}), 500
 
-        # Check for open tickets for this customer
-        tickets_url = f"{base_url}/tickets"
-        ticket_params = {"customer_id": customer_id}
-
-        ticket_resp = requests.get(
-            tickets_url, headers=headers, params=ticket_params, timeout=10
-        )
-
-        if ticket_resp.status_code == 200:
-            ticket_data = ticket_resp.json()
-            tickets = ticket_data.get("tickets", [])
-
-            # Debug: Print all ticket statuses to see what RepairShopr actually uses
-            print(f"🔍 All tickets for customer {customer_id}:")
-            for ticket in tickets:
-                print(
-                    f"  - Ticket {ticket.get('id')}: Status = '{ticket.get('status')}', Subject = '{ticket.get('subject', 'No subject')[:50]}'"
+        conn = get_novacore_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id FROM tickets
+                    WHERE customer_id = %s
+                      AND status NOT IN ('Resolved', 'Closed', 'Invoiced')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (customer_id,),
                 )
+                row = cur.fetchone()
+        finally:
+            conn.close()
 
-            # Look for open tickets - all RepairShopr statuses except cancelled/resolved
-            open_statuses = [
-                "New",
-                "In Progress",
-                "On Site",
-                "Scheduled",
-                "Sourcing Parts",
-                "Waiting for Parts",
-                "Contact Customer",
-                "Waiting on Customer",
-                "Customer Reply",
-                "Quote Ready",
-                "Pickup Device",
-                "Rescheduled",
-                "FlashBack Data",
-                "Ready for Pick-Up",
-                "Ready for Drop Off",
-                # Excluded: "Cancelled Ticket", "Resolved"
-            ]
+        if row:
+            ticket_id = row["id"]
+            url = f"{public_url}/tickets/{ticket_id}"
+            print(f"🎫 Opening NovaCore ticket {ticket_id}")
+            return jsonify({"url": url, "type": "ticket", "ticket_id": ticket_id})
 
-            open_tickets = [t for t in tickets if t.get("status") in open_statuses]
-
-            print(
-                f"📋 Found {len(open_tickets)} open tickets out of {len(tickets)} total tickets"
-            )
-
-            if open_tickets:
-                # Open the most recent open ticket
-                ticket_id = open_tickets[0].get("id")
-                ticket_status = open_tickets[0].get("status")
-                url = f"https://pcreps.repairshopr.com/tickets/{ticket_id}"
-                print(f"🎫 Opening ticket {ticket_id} with status '{ticket_status}'")
-                return jsonify(
-                    {
-                        "url": url,
-                        "type": "ticket",
-                        "ticket_id": ticket_id,
-                        "status": ticket_status,
-                    }
-                )
-
-        # No open tickets, open customer profile
-        url = f"https://pcreps.repairshopr.com/customers/{customer_id}"
-        print(f"👤 Opening customer profile: {customer_id}")
+        url = f"{public_url}/customer/{customer_id}"
+        print(f"👤 Opening NovaCore customer {customer_id}")
         return jsonify({"url": url, "type": "customer", "customer_id": customer_id})
 
-    except requests.RequestException as e:
-        print(f"❌ RepairShopr API request failed: {e}")
-        return jsonify({"error": "Failed to connect to RepairShopr"}), 500
     except Exception as e:
-        print(f"❌ RepairShopr lookup error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"❌ NovaCore lookup error: {e}")
+        return jsonify({"error": "NovaCore lookup failed"}), 500
 
 
 @app.route("/api/greetings/add-dnd", methods=["GET", "POST"])

@@ -81,10 +81,6 @@ def notify_novacore_ticket(phone_number, direction, comm_type, body="", staff_us
         print(f"[NOVACORE-NOTIFY] Error (non-blocking): {e}", flush=True)
 
 
-REPAIRSHOPR_SMS_FORWARD_URL = os.getenv("REPAIRSHOPR_SMS_FORWARD_URL")
-REPAIRSHOPR_TOKEN = os.getenv("REPAIRSHOPR_TOKEN")
-REPAIRSHOPR_API_KEY = os.getenv("REPAIRSHOPR_API_KEY")
-REPAIRSHOPR_BASE_URL = os.getenv("REPAIRSHOPR_BASE_URL")
 NOVACORE_URL = os.getenv("NOVACORE_URL", "http://pcreps:5000")
 SOFTPHONE_API_KEY = os.getenv("SOFTPHONE_API_KEY", "")
 
@@ -479,97 +475,6 @@ def log_message(
         print(f"⚠️ Error logging message: {e}")
 
 
-def forward_sms_to_repairshopr(request_form):
-    try:
-        payload = request_form.to_dict()
-        url = f"{REPAIRSHOPR_SMS_FORWARD_URL}?token={REPAIRSHOPR_TOKEN}"
-        print(f"📨 Forwarding SMS to RS → {url}")
-        print(f"📦 Payload: {payload}")
-        response = requests.post(url, data=payload, timeout=5)
-        print(f"📬 Response Code: {response.status_code}")
-        print(f"📬 Response Body: {response.text}")
-        response.raise_for_status()
-        print(f"✅ Forwarded SMS to RepairShopr (status {response.status_code})")
-    except Exception as e:
-        print(f"❌ Failed to forward SMS to RepairShopr: {e}")
-
-
-def post_outbound_comment_to_ticket(phone_number, message_body):
-    import re
-    import subprocess
-    import requests
-
-    try:
-        headers = {"Authorization": f"Bearer {REPAIRSHOPR_API_KEY}"}
-        normalized_phone = re.sub(r"\D", "", phone_number)[-10:]
-        search_url = f"{REPAIRSHOPR_BASE_URL}/customers?query={normalized_phone}"
-        print(f"📡 Looking up customer with phone: {normalized_phone}")
-        print(f"🔗 Full URL: {search_url}")
-        resp = requests.get(search_url, headers=headers, timeout=5)
-        if resp.status_code != 200:
-            print(f"❌ Failed to lookup customer: {resp.text}")
-            return
-        data = resp.json()
-        customers = data.get("customers", [])
-        if not customers:
-            print(f"ℹ️ No matching customer found. Response was: {data}")
-            return
-
-        customer_id = customers[0].get("id")
-        ticket_resp = requests.get(
-            f"{REPAIRSHOPR_BASE_URL}/tickets",
-            headers=headers,
-            params={"customer_id": customer_id},
-            timeout=5,
-        )
-        print(f"📬 Ticket lookup response: {ticket_resp.status_code}")
-        print(f"🧾 Tickets found: {len(ticket_resp.json().get('tickets', []))}")
-        if ticket_resp.status_code != 200:
-            print(f"❌ Failed to get tickets: {ticket_resp.text}")
-            return
-        ticket_data = ticket_resp.json()
-        tickets = ticket_data.get("tickets", [])
-        open_tickets = [
-            t
-            for t in tickets
-            if t.get("status")
-            in ["New", "In Progress", "Waiting on Customer", "Customer Reply"]
-        ]
-        if not open_tickets:
-            print("ℹ️ No open tickets for this customer. Skipping comment.")
-            return
-        ticket_id = open_tickets[0].get("id")
-        result = subprocess.run(
-            [
-                "powershell",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                "E:/PC Reps/softphone/send_comment_to_rs.ps1",
-                "-TicketId",
-                str(ticket_id),
-                "-Message",
-                message_body,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        print("✅ PowerShell script executed successfully.")
-        print("STDOUT:", result.stdout)
-        print("STDERR:", result.stderr)
-    except subprocess.CalledProcessError as e:
-        print("❌ PowerShell script failed:")
-        print("Return Code:", e.returncode)
-        print("STDOUT:", e.stdout)
-        print("STDERR:", e.stderr)
-    except Exception as e:
-        import traceback
-
-        print(f"❌ Error posting comment to RepairShopr: {e}")
-        traceback.print_exc()
-
-
 @messaging_bp.route("/messages/status", methods=["POST"])
 def message_status_callback():
     try:
@@ -870,8 +775,6 @@ def send_sms():
                 user_id=current_user.id if current_user.is_authenticated else None,
             )
 
-        post_outbound_comment_to_ticket(to_number, message_body)
-
         # Notify NovaCore to log this outbound SMS on the customer's ticket
         notify_novacore_ticket(to_number, "outbound", "sms", body=message_body, staff_user_id=current_user.id if current_user.is_authenticated else None)
 
@@ -1046,9 +949,6 @@ def receive_sms():
         import traceback
 
         traceback.print_exc()
-
-    # Forward to RepairShopr
-    forward_sms_to_repairshopr(request.form)
 
     return "<Response></Response>", 200, {"Content-Type": "text/xml"}
 
