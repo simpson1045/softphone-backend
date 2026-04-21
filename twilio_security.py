@@ -73,10 +73,14 @@ def validate_twilio_request(f):
 
         validator = RequestValidator(auth_token)
         if not validator.validate(url, params, signature):
+            # Compute what we think the signature should have been, so the logs
+            # show EXACTLY where we diverge from what Twilio sent.
+            expected = validator.compute_signature(url, params)
             log.warning(
                 "Twilio signature validation FAILED "
-                f"url={url!r} remote={request.remote_addr} "
-                f"enforce={enforce}"
+                f"url={url!r} remote={request.remote_addr} enforce={enforce} "
+                f"received_sig={signature!r} computed_sig={expected!r} "
+                f"token_prefix={auth_token[:4]}... params_keys={sorted(params.keys())}"
             )
             if enforce:
                 abort(403)
