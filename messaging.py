@@ -7,6 +7,7 @@ from datetime import datetime
 import requests
 import re
 import json
+import threading
 from flask_socketio import emit
 from pytz import timezone
 from flask_login import current_user
@@ -42,44 +43,40 @@ def get_novacore_connection():
 def notify_novacore_ticket(phone_number, direction, comm_type, body="", staff_user_id=None):
     """
     Fire-and-forget notification to NovaCore about an SMS/call event.
-    NovaCore will look up the customer, find their open ticket, and log it.
-
-    Args:
-        phone_number: The customer's phone number
-        direction: "inbound" or "outbound"
-        comm_type: "sms" or "call"
-        body: Message text (empty for calls)
-        staff_user_id: The staff user ID for outbound messages
+    Dispatched on a background thread so the caller's HTTP response
+    is never blocked by NovaCore latency or downtime.
     """
-    try:
-        api_key = os.getenv("EXTERNAL_SMS_API_KEY", "")
-        if not api_key:
-            print("[NOVACORE-NOTIFY] No API key configured, skipping", flush=True)
-            return
+    api_key = os.getenv("EXTERNAL_SMS_API_KEY", "")
+    if not api_key:
+        print("[NOVACORE-NOTIFY] No API key configured, skipping", flush=True)
+        return
 
-        payload = {
-            "phone_number": phone_number,
-            "direction": direction,
-            "comm_type": comm_type,
-            "body": body or "",
-        }
-        if staff_user_id:
-            payload["staff_user_id"] = staff_user_id
+    payload = {
+        "phone_number": phone_number,
+        "direction": direction,
+        "comm_type": comm_type,
+        "body": body or "",
+    }
+    if staff_user_id:
+        payload["staff_user_id"] = staff_user_id
 
-        novacore_url = os.getenv("NOVACORE_URL", "http://pcreps:5000")
-        resp = requests.post(
-            f"{novacore_url}/api/ticket-comms/event",
-            json=payload,
-            headers={"Content-Type": "application/json", "X-API-Key": api_key},
-            timeout=5,
-        )
-        result = resp.json() if resp.status_code == 200 else {}
-        action = result.get("action", "unknown")
-        print(f"[NOVACORE-NOTIFY] {direction} {comm_type} → ticket sync: {action}", flush=True)
+    novacore_url = os.getenv("NOVACORE_URL", "http://pcreps:5000")
 
-    except Exception as e:
-        # Fire-and-forget — never let this break the main flow
-        print(f"[NOVACORE-NOTIFY] Error (non-blocking): {e}", flush=True)
+    def _post():
+        try:
+            resp = requests.post(
+                f"{novacore_url}/api/ticket-comms/event",
+                json=payload,
+                headers={"Content-Type": "application/json", "X-API-Key": api_key},
+                timeout=5,
+            )
+            result = resp.json() if resp.status_code == 200 else {}
+            action = result.get("action", "unknown")
+            print(f"[NOVACORE-NOTIFY] {direction} {comm_type} → ticket sync: {action}", flush=True)
+        except Exception as e:
+            print(f"[NOVACORE-NOTIFY] Error (non-blocking): {e}", flush=True)
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 NOVACORE_URL = os.getenv("NOVACORE_URL", "http://pcreps:5000")
@@ -560,6 +557,12 @@ def send_sms():
 
     to_number = request.form.get("to")
     message_body = request.form.get("message")
+    # Chunk-index protocol from useMessageSender: present on every chunk
+    # of a multi-chunk send. Used to fire NovaCore notify once per logical
+    # message (on the final chunk) with the full pre-split body.
+    chunk_index = request.form.get("chunk_index")
+    total_chunks = request.form.get("total_chunks")
+    full_body = request.form.get("full_body")
 
     # Get multiple files - they'll be named 'media[]' or just multiple 'media' fields
     media_files = request.files.getlist("media")
@@ -777,8 +780,30 @@ def send_sms():
                 user_id=current_user.id if current_user.is_authenticated else None,
             )
 
-        # Notify NovaCore to log this outbound SMS on the customer's ticket
-        notify_novacore_ticket(to_number, "outbound", "sms", body=message_body, staff_user_id=current_user.id if current_user.is_authenticated else None)
+        # Notify NovaCore once per logical message:
+        # - Chunked send (frontend sets chunk_index/total_chunks): notify only
+        #   on the final chunk, with the full pre-split body.
+        # - Legacy/single-shot caller (no chunk fields): notify with the
+        #   request body, same as before.
+        should_notify = True
+        notify_body = message_body
+        if total_chunks is not None and chunk_index is not None:
+            try:
+                is_final = int(chunk_index) == int(total_chunks) - 1
+            except (TypeError, ValueError):
+                is_final = True  # malformed — fail open, don't lose the notify
+            should_notify = is_final
+            if is_final and full_body is not None:
+                notify_body = full_body
+
+        if should_notify:
+            notify_novacore_ticket(
+                to_number,
+                "outbound",
+                "sms",
+                body=notify_body,
+                staff_user_id=current_user.id if current_user.is_authenticated else None,
+            )
 
         return jsonify(
             {
