@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+
+# Local databases (live data lives in Postgres; these are dev/runtime sqlite artifacts)
+*.sqlite3
+*.sqlite
+*.db
+
+# Secrets & TLS — must never be committed
+.env
+.env.*
+cert.pem
+key.pem
+
+# Node (the backend has a node_modules from twilio-voice-sdk usage)
+node_modules/
+
+# Runtime data — never committed
+recordings/
+static/uploads/
+incoming_sms_log.txt
+scanner_attempts.log
+address_book_loaded.txt
+*.log
+
+# Customer data exports (one-off CSVs from migration work)
+*_customers.csv
