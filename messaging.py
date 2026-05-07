@@ -16,6 +16,7 @@ from psycopg2.extras import RealDictCursor
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
 from twilio_security import validate_twilio_request
+from tenant_context import current_tenant_id
 
 pacific = timezone("US/Pacific")
 messaging_bp = Blueprint("messaging", __name__)
@@ -180,14 +181,15 @@ def send_status_auto_reply(phone_number):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT timestamp FROM messages 
-            WHERE phone_number = %s 
-            AND direction = 'outbound' 
+            SELECT timestamp FROM messages
+            WHERE phone_number = %s
+            AND direction = 'outbound'
             AND (is_auto_sms = 1 OR body ILIKE '%PC Reps%sick%' OR body ILIKE '%PC Reps%vacation%' OR body ILIKE '%PC Reps%holiday%')
             AND timestamp > %s
+            AND tenant_id = %s
             ORDER BY timestamp DESC LIMIT 1
         """,
-            (normalized_phone, cutoff_time),
+            (normalized_phone, cutoff_time, current_tenant_id()),
         )
 
         recent_status = cur.fetchone()
@@ -283,14 +285,15 @@ def send_closed_day_text_reply(phone_number):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT timestamp FROM messages 
-            WHERE phone_number = %s 
-            AND direction = 'outbound' 
+            SELECT timestamp FROM messages
+            WHERE phone_number = %s
+            AND direction = 'outbound'
             AND is_auto_sms = 1
             AND timestamp > %s
+            AND tenant_id = %s
             ORDER BY timestamp DESC LIMIT 1
         """,
-            (normalized_phone, cutoff_time),
+            (normalized_phone, cutoff_time, current_tenant_id()),
         )
 
         recent_auto_reply = cur.fetchone()
@@ -430,14 +433,15 @@ def log_message(
                     cur = conn.cursor()
                     cur.execute(
                         """
-                        SELECT id FROM messages 
-                        WHERE phone_number = %s 
-                        AND direction = 'outbound' 
-                        AND body LIKE %s 
-                        ORDER BY timestamp DESC 
+                        SELECT id FROM messages
+                        WHERE phone_number = %s
+                        AND direction = 'outbound'
+                        AND body LIKE %s
+                        AND tenant_id = %s
+                        ORDER BY timestamp DESC
                         LIMIT 1
                     """,
-                        (normalized_phone, f"%{quoted_text}%"),
+                        (normalized_phone, f"%{quoted_text}%", current_tenant_id()),
                     )
 
                     result = cur.fetchone()
@@ -450,10 +454,11 @@ def log_message(
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO messages (direction, phone_number, body, media_urls, timestamp, read, twilio_sid, status, is_auto_sms, is_reaction, reacted_to_message_id, user_id)
-            VALUES (%s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s)
+            INSERT INTO messages (tenant_id, direction, phone_number, body, media_urls, timestamp, read, twilio_sid, status, is_auto_sms, is_reaction, reacted_to_message_id, user_id)
+            VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s)
         """,
             (
+                current_tenant_id(),
                 direction,
                 normalized_phone,
                 body,
@@ -1000,8 +1005,12 @@ def delete_threads():
                 normalized_numbers.append(normalized)
 
         if normalized_numbers:
+            tid = current_tenant_id()
             for pn in normalized_numbers:
-                cur.execute("DELETE FROM messages WHERE phone_number = %s", (pn,))
+                cur.execute(
+                    "DELETE FROM messages WHERE phone_number = %s AND tenant_id = %s",
+                    (pn, tid),
+                )
             conn.commit()
         conn.close()
 
@@ -1045,10 +1054,10 @@ def get_thread(phone_number):
         cur.execute(
             """
             SELECT * FROM messages
-            WHERE phone_number = %s
+            WHERE phone_number = %s AND tenant_id = %s
             ORDER BY timestamp ASC
         """,
-            (normalized_phone,),
+            (normalized_phone, current_tenant_id()),
         )
         rows = cur.fetchall()
         conn.close()
@@ -1100,8 +1109,9 @@ def mark_thread_read(phone_number):
             UPDATE messages
             SET read = 1
             WHERE phone_number = %s AND direction = 'inbound' AND read = 0
+              AND tenant_id = %s
         """,
-            (normalized_phone,),
+            (normalized_phone, current_tenant_id()),
         )
         updated = cur.rowcount
         conn.commit()
@@ -1125,20 +1135,23 @@ def mark_thread_unread(phone_number):
 
         conn = get_db_connection()
         cur = conn.cursor()
-        # Only mark the most recent inbound message as unread (for visual indicator)
+        # Only mark the most recent inbound message as unread (for visual indicator).
+        # tenant_id filter on BOTH outer UPDATE and inner SELECT — otherwise we
+        # could pick a HaniTech message id and try to update a PC Reps row.
+        tid = current_tenant_id()
         cur.execute(
             """
             UPDATE messages
             SET read = 0
-            WHERE phone_number = %s AND direction = 'inbound'
+            WHERE phone_number = %s AND direction = 'inbound' AND tenant_id = %s
             AND id = (
-                SELECT id FROM messages 
-                WHERE phone_number = %s AND direction = 'inbound' 
-                ORDER BY timestamp DESC 
+                SELECT id FROM messages
+                WHERE phone_number = %s AND direction = 'inbound' AND tenant_id = %s
+                ORDER BY timestamp DESC
                 LIMIT 1
             )
         """,
-            (normalized_phone, normalized_phone),
+            (normalized_phone, tid, normalized_phone, tid),
         )
         updated = cur.rowcount
         conn.commit()
@@ -1161,17 +1174,18 @@ def search_messages():
 
         # Search through all messages
         search_term = f"%{query}%"
+        tid = current_tenant_id()
         cur.execute(
             """
-            SELECT DISTINCT phone_number, 
+            SELECT DISTINCT phone_number,
                    COUNT(*) as match_count,
                    MAX(timestamp) as latest_match_timestamp
-            FROM messages 
-            WHERE body ILIKE %s
+            FROM messages
+            WHERE body ILIKE %s AND tenant_id = %s
             GROUP BY phone_number
             ORDER BY latest_match_timestamp DESC
         """,
-            (search_term,),
+            (search_term, tid),
         )
 
         search_results = []
@@ -1186,12 +1200,12 @@ def search_messages():
             cur.execute(
                 """
                 SELECT body, timestamp, direction
-                FROM messages 
-                WHERE phone_number = %s AND body ILIKE %s
+                FROM messages
+                WHERE phone_number = %s AND body ILIKE %s AND tenant_id = %s
                 ORDER BY timestamp DESC
                 LIMIT 3
             """,
-                (phone_number, search_term),
+                (phone_number, search_term, tid),
             )
 
             matching_messages = []
@@ -1253,10 +1267,12 @@ def get_recent_contacts():
             """
             SELECT DISTINCT phone_number, MAX(timestamp) as last_contact
             FROM messages
+            WHERE tenant_id = %s
             GROUP BY phone_number
             ORDER BY last_contact DESC
             LIMIT 10
-        """
+        """,
+            (current_tenant_id(),),
         )
 
         recent_numbers = [row["phone_number"] for row in cur.fetchall()]
@@ -1316,7 +1332,9 @@ def get_message_threads():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Get threads with flags from local DB, then resolve names via NovaCore
+        # Get threads with flags from local DB, then resolve names via NovaCore.
+        # tenant_id filter applied to each user-data CTE and to the contact_flags
+        # join. flag_types is shared across tenants (lookup table).
         cur.execute("""
             WITH latest_messages AS (
                 SELECT
@@ -1326,13 +1344,14 @@ def get_message_threads():
                     timestamp,
                     ROW_NUMBER() OVER (PARTITION BY phone_number ORDER BY timestamp DESC) as rn
                 FROM messages
+                WHERE tenant_id = %(tid)s
             ),
             unread_counts AS (
                 SELECT
                     phone_number,
                     COUNT(*) as unread_count
                 FROM messages
-                WHERE direction = 'inbound' AND read = 0
+                WHERE direction = 'inbound' AND read = 0 AND tenant_id = %(tid)s
                 GROUP BY phone_number
             ),
             outbound_latest AS (
@@ -1342,7 +1361,7 @@ def get_message_threads():
                     status_reason,
                     ROW_NUMBER() OVER (PARTITION BY phone_number ORDER BY timestamp DESC) as rn
                 FROM messages
-                WHERE direction = 'outbound'
+                WHERE direction = 'outbound' AND tenant_id = %(tid)s
             )
             SELECT
                 lm.phone_number,
@@ -1359,11 +1378,11 @@ def get_message_threads():
             FROM latest_messages lm
             LEFT JOIN unread_counts uc ON lm.phone_number = uc.phone_number
             LEFT JOIN outbound_latest ol ON lm.phone_number = ol.phone_number AND ol.rn = 1
-            LEFT JOIN contact_flags cf ON cf.phone_number = lm.phone_number
+            LEFT JOIN contact_flags cf ON cf.phone_number = lm.phone_number AND cf.tenant_id = %(tid)s
             LEFT JOIN flag_types ft ON cf.flag_type_id = ft.id
             WHERE lm.rn = 1
             ORDER BY lm.timestamp DESC
-        """)
+        """, {"tid": current_tenant_id()})
 
         rows = cur.fetchall()
         conn.close()
@@ -1642,8 +1661,13 @@ def toggle_message_pin(message_id):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Get current pin status
-        cur.execute("SELECT pinned FROM messages WHERE id = %s", (message_id,))
+        # Get current pin status (tenant filter so a user can't toggle
+        # another tenant's message by guessing IDs)
+        tid = current_tenant_id()
+        cur.execute(
+            "SELECT pinned FROM messages WHERE id = %s AND tenant_id = %s",
+            (message_id, tid),
+        )
         result = cur.fetchone()
 
         if not result:
@@ -1653,8 +1677,8 @@ def toggle_message_pin(message_id):
         # Toggle pin status
         new_pin_status = 0 if result["pinned"] else 1
         cur.execute(
-            "UPDATE messages SET pinned = %s WHERE id = %s",
-            (new_pin_status, message_id),
+            "UPDATE messages SET pinned = %s WHERE id = %s AND tenant_id = %s",
+            (new_pin_status, message_id, tid),
         )
         conn.commit()
         conn.close()
@@ -1678,10 +1702,10 @@ def get_pinned_messages(phone_number):
         cur.execute(
             """
             SELECT * FROM messages
-            WHERE phone_number = %s AND pinned = 1
+            WHERE phone_number = %s AND pinned = 1 AND tenant_id = %s
             ORDER BY timestamp DESC
         """,
-            (normalized_phone,),
+            (normalized_phone, current_tenant_id()),
         )
 
         pinned_messages = []
@@ -1712,14 +1736,22 @@ def delete_message(message_id):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Check if message exists
-        cur.execute("SELECT id FROM messages WHERE id = %s", (message_id,))
+        # Check if message exists in current tenant (prevents
+        # cross-tenant deletion by guessing IDs)
+        tid = current_tenant_id()
+        cur.execute(
+            "SELECT id FROM messages WHERE id = %s AND tenant_id = %s",
+            (message_id, tid),
+        )
         if not cur.fetchone():
             conn.close()
             return jsonify({"error": "Message not found"}), 404
 
         # Delete the message
-        cur.execute("DELETE FROM messages WHERE id = %s", (message_id,))
+        cur.execute(
+            "DELETE FROM messages WHERE id = %s AND tenant_id = %s",
+            (message_id, tid),
+        )
         conn.commit()
         conn.close()
 
@@ -1742,11 +1774,12 @@ def get_message_reactions(phone_number):
         cur.execute(
             """
             SELECT reacted_to_message_id, body, timestamp
-            FROM messages 
+            FROM messages
             WHERE phone_number = %s AND is_reaction = 1 AND reacted_to_message_id IS NOT NULL
+              AND tenant_id = %s
             ORDER BY timestamp DESC
         """,
-            (normalized_phone,),
+            (normalized_phone, current_tenant_id()),
         )
 
         reactions = {}
