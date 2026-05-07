@@ -21,6 +21,19 @@ incoming_bp = Blueprint("incoming", __name__)
 pacific = timezone("US/Pacific")
 
 
+def _play_or_say(response, audio_url,
+                 fallback_text="Please leave a message after the beep."):
+    """Add a <Play> if we have a recorded greeting URL, otherwise <Say>.
+
+    Used so a tenant with no `greetings` rows yet (e.g. brand-new
+    HaniTech) doesn't fall through to a hardcoded PC Reps mp3 URL.
+    """
+    if audio_url:
+        response.play(audio_url)
+    else:
+        response.say(fallback_text)
+
+
 def get_novacore_connection():
     """Get a connection to the NovaCore PostgreSQL database"""
     password = os.getenv("POSTGRES_PASSWORD")
@@ -688,9 +701,7 @@ def incoming():
                 conn.close()
 
                 greeting_audio_url = (
-                    open_greeting["audio_url"]
-                    if open_greeting
-                    else "https://softphone.pc-reps.com/new_open.mp3"
+                    open_greeting["audio_url"] if open_greeting else None
                 )
                 status = "missed_call_dnd_auto_open"
             else:
@@ -705,19 +716,13 @@ def incoming():
                 conn.close()
 
                 greeting_audio_url = (
-                    closed_greeting["audio_url"]
-                    if closed_greeting
-                    else "https://softphone.pc-reps.com/new_closed.mp3"
+                    closed_greeting["audio_url"] if closed_greeting else None
                 )
                 status = "missed_call_dnd_auto_closed"
         else:
             # Manual mode with DND - use the specific greeting
             greeting_audio_url = (
-                active_greeting.get(
-                    "audio_url", "https://softphone.pc-reps.com/new_closed.mp3"
-                )
-                if active_greeting
-                else "https://softphone.pc-reps.com/new_closed.mp3"
+                active_greeting.get("audio_url") if active_greeting else None
             )
             greeting_name = (
                 active_greeting.get("name", "Unknown") if active_greeting else "Unknown"
@@ -730,7 +735,7 @@ def incoming():
             print(f"🔇 DND + {greeting_name}")
 
         # Play greeting and go to voicemail (no dial attempt)
-        response.play(greeting_audio_url)
+        _play_or_say(response, greeting_audio_url)
         response.play("https://softphone.pc-reps.com/beep.mp3")
         response.record(
             max_length=60,
@@ -815,9 +820,7 @@ def incoming():
             conn.close()
 
             greeting_audio_url = (
-                closed_greeting["audio_url"]
-                if closed_greeting
-                else "https://softphone.pc-reps.com/new_closed.mp3"
+                closed_greeting["audio_url"] if closed_greeting else None
             )
 
             # Play greeting and go to voicemail
@@ -888,10 +891,9 @@ def incoming():
         greeting_name = "OPEN OVERRIDE (Call Routed)"
 
     else:
-        # CLOSED/MANUAL MODE: Use the specifically selected greeting (goes to voicemail)
-        greeting_audio_url = (
-            "https://softphone.pc-reps.com/new_closed.mp3"  # Default fallback
-        )
+        # CLOSED/MANUAL MODE: Use the specifically selected greeting (goes to voicemail).
+        # No hardcoded URL fallback here — _play_or_say below uses TTS when this is None.
+        greeting_audio_url = None
         greeting_name = "Unknown"
         status = "missed_call_manual_mode"
 
@@ -904,7 +906,7 @@ def incoming():
             print("⚠️ No active greeting found, using fallback")
 
         # Play greeting and go to voicemail for manual modes
-        response.play(greeting_audio_url)
+        _play_or_say(response, greeting_audio_url)
         response.play("https://softphone.pc-reps.com/beep.mp3")
         response.record(
             max_length=60,
@@ -998,23 +1000,13 @@ def dial_status():
             open_greeting = cur.fetchone()
             conn.close()
 
-            greeting_url = (
-                open_greeting["audio_url"]
-                if open_greeting
-                else "https://softphone.pc-reps.com/new_open.mp3"
-            )
+            greeting_url = open_greeting["audio_url"] if open_greeting else None
         else:
             # Use the active greeting for manual modes
-            greeting_url = (
-                active_greeting.get(
-                    "audio_url", "https://softphone.pc-reps.com/new_closed.mp3"
-                )
-                if active_greeting
-                else "https://softphone.pc-reps.com/new_closed.mp3"
-            )
+            greeting_url = active_greeting.get("audio_url") if active_greeting else None
 
         # Play voicemail greeting and record
-        response.play(greeting_url)
+        _play_or_say(response, greeting_url)
         response.play("https://softphone.pc-reps.com/beep.mp3")
         response.record(
             max_length=60,

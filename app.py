@@ -2032,7 +2032,15 @@ def add_dnd_greeting():
                 {"message": "DND greeting already exists", "id": existing["id"]}
             )
 
-        # Add DND greeting for this tenant
+        # Add DND greeting for this tenant. PC Reps gets the existing
+        # new_dnd.mp3 default; other tenants start with NULL audio_url
+        # and the IVR's _play_or_say helper falls back to TTS until
+        # they upload one via /api/greetings/<id>/audio.
+        default_audio = (
+            "https://softphone.pc-reps.com/new_dnd.mp3"
+            if current_tenant().get("contact_provider") == "novacore"
+            else None
+        )
         cursor.execute(
             """
             INSERT INTO greetings (tenant_id, type, name, auto_sms_message, audio_url, is_active, created_at)
@@ -2044,7 +2052,7 @@ def add_dnd_greeting():
                 "dnd",
                 "Do Not Disturb",
                 "Smart DND mode - uses open/closed SMS based on hours",
-                "https://softphone.pc-reps.com/new_dnd.mp3",
+                default_audio,
                 0,
             ),
         )
