@@ -201,7 +201,11 @@ def login():
         return jsonify({'error': 'Invalid email or password'}), 401
     if user:
         login_user(user, remember=True)
-        return jsonify({'success': True, 'user': _user_to_json(user)}), 200
+        return jsonify({
+            'success': True,
+            'user': _user_to_json(user),
+            'tenant': _tenant_to_json(user.tenant_id),
+        }), 200
 
     # 2. Fall through to NovaCore (PC Reps employees)
     user = _try_login_novacore_user(email, password)
@@ -209,7 +213,11 @@ def login():
         return jsonify({'error': 'Invalid email or password'}), 401
     if user:
         login_user(user, remember=True)
-        return jsonify({'success': True, 'user': _user_to_json(user)}), 200
+        return jsonify({
+            'success': True,
+            'user': _user_to_json(user),
+            'tenant': _tenant_to_json(user.tenant_id),
+        }), 200
 
     return jsonify({'error': 'Invalid email or password'}), 401
 
@@ -225,6 +233,27 @@ def _user_to_json(user):
         'user_color': user.user_color,
         'tenant_id': user.tenant_id,
     }
+
+
+def _tenant_to_json(tenant_id):
+    """Tenant metadata block for auth responses (drives frontend branding)."""
+    if tenant_id is None:
+        return None
+    try:
+        from tenant_context import tenant_by_id
+        t = tenant_by_id(tenant_id)
+        return {
+            'id': t['id'],
+            'slug': t['slug'],
+            'name': t['name'],
+            'phone_number': t['phone_number'],
+            'logo_url': t.get('logo_url'),
+            'color': t.get('color'),
+            'contact_provider': t['contact_provider'],
+        }
+    except Exception as e:
+        print(f"⚠️ tenant_by_id({tenant_id}) failed in auth response: {e}")
+        return None
 
 
 def _try_login_softphone_user(email, password):
@@ -312,7 +341,8 @@ def logout():
 
 @auth_bp.route('/api/auth/check', methods=['GET'])
 def check_auth():
-    """Check if user is authenticated"""
+    """Check if user is authenticated. Returns tenant block too so the
+    frontend can render branding (logo, name, color) on first paint."""
     if current_user.is_authenticated:
         return jsonify({
             'authenticated': True,
@@ -325,7 +355,8 @@ def check_auth():
                 'role': current_user.role,
                 'user_color': current_user.user_color,
                 'tenant_id': current_user.tenant_id,
-            }
+            },
+            'tenant': _tenant_to_json(current_user.tenant_id),
         }), 200
     else:
         return jsonify({'authenticated': False}), 200

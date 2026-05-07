@@ -83,18 +83,21 @@ def current_tenant_id() -> int:
     return _default_tenant_id()
 
 
+_TENANT_COLS = "id, slug, name, phone_number, contact_provider, logo_url, color"
+
+
 @lru_cache(maxsize=8)
 def tenant_by_id(tenant_id: int) -> dict:
     """
     Return the tenants-table row for `tenant_id` as a dict, with keys:
-        id, slug, name, phone_number, contact_provider
-    Cached because tenants change rarely.
+        id, slug, name, phone_number, contact_provider, logo_url, color
+    Cached because tenants change rarely. Clear via tenant_by_id.cache_clear()
+    if you ever update branding live without restarting.
     """
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, slug, name, phone_number, contact_provider "
-            "FROM tenants WHERE id = ?",
+            f"SELECT {_TENANT_COLS} FROM tenants WHERE id = ?",
             (tenant_id,),
         )
         row = cur.fetchone()
@@ -111,8 +114,7 @@ def tenant_by_phone(phone_number: str) -> dict | None:
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, slug, name, phone_number, contact_provider "
-            "FROM tenants WHERE phone_number = ?",
+            f"SELECT {_TENANT_COLS} FROM tenants WHERE phone_number = ?",
             (phone_number,),
         )
         row = cur.fetchone()
