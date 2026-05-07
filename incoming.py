@@ -12,7 +12,10 @@ from messaging import log_message
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
 from twilio_security import validate_twilio_request
-from tenant_context import current_tenant_id
+from tenant_context import (
+    current_tenant_id, current_tenant,
+    set_thread_tenant_id, clear_thread_tenant_id,
+)
 
 incoming_bp = Blueprint("incoming", __name__)
 pacific = timezone("US/Pacific")
@@ -305,10 +308,13 @@ def send_auto_sms(phone_number, call_log_id=None):
             )
             return False
 
-        # Send the SMS
+        # Send the SMS — sms_from_number comes from the current tenant
+        # (set by Phase 3 webhook router from `To`, then propagated into
+        # this background thread by delayed_auto_sms via set_thread_tenant_id).
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-        sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
+        sms_from_number = current_tenant().get("phone_number") \
+            or os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
 
         if not account_sid or not auth_token:
             print("❌ Missing Twilio credentials for auto-SMS")
@@ -451,14 +457,26 @@ def send_auto_sms(phone_number, call_log_id=None):
 
 
 def delayed_auto_sms(phone_number, call_log_id, delay_seconds=45):
-    """Send auto-SMS after a delay (UPDATED: 45 seconds for missed calls)"""
+    """Send auto-SMS after a delay (UPDATED: 45 seconds for missed calls).
+
+    Captures the current tenant_id at call time (we're inside a Flask
+    request context here, so g.tenant_id was set by the Phase 3 webhook
+    router) and re-pins it inside the background thread so all the
+    db queries in send_auto_sms scope to the right tenant.
+    """
+    captured_tenant_id = current_tenant_id()
 
     def send_after_delay():
-        print(
-            f"⏰ Waiting {delay_seconds} seconds before sending auto-SMS to {phone_number}"
-        )
-        time.sleep(delay_seconds)
-        send_auto_sms(phone_number, call_log_id)
+        set_thread_tenant_id(captured_tenant_id)
+        try:
+            print(
+                f"⏰ Waiting {delay_seconds} seconds before sending auto-SMS "
+                f"to {phone_number} (tenant_id={captured_tenant_id})"
+            )
+            time.sleep(delay_seconds)
+            send_auto_sms(phone_number, call_log_id)
+        finally:
+            clear_thread_tenant_id()
 
     # Start background thread
     thread = threading.Thread(target=send_after_delay)

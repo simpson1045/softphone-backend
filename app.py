@@ -27,7 +27,10 @@ from auth import auth_bp, init_login_manager
 from database import get_db_connection
 from call_recording import call_recording_bp
 from twilio_security import validate_twilio_request
-from tenant_context import current_tenant_id, tenant_by_phone
+from tenant_context import (
+    current_tenant_id, current_tenant, tenant_by_phone,
+    tenant_id_for_employee_id,
+)
 
 import sys
 
@@ -187,40 +190,48 @@ def require_authentication():
 
 @app.before_request
 def resolve_tenant_from_webhook():
-    """Set g.tenant_id from the inbound `To` number on Twilio webhooks.
+    """Set g.tenant_id on Twilio webhooks based on the request fields.
 
-    Twilio webhooks (POST /incoming, /dial-status, /messages/incoming, etc.)
-    don't have a logged-in user, so without this hook every webhook would
-    fall back to the pc_reps tenant via tenant_context.current_tenant_id().
+    Two paths:
+    1. INBOUND (e.g. /incoming for voice, /messages/incoming for SMS):
+       Twilio sends `To = our tenant's number`. Match by phone.
+    2. OUTBOUND (e.g. /call/flow): Twilio sends `From = client:<identity>`
+       where `<identity>` is the originating user's employee_id. Match
+       through softphone_users / NovaCore to find the user's tenant.
 
-    Reading `To` from request.values lets us route HaniTech inbound traffic
-    (To = +17756185775) to the hanitech tenant and PC Reps inbound traffic
-    (To = +17754602190) to pc_reps. If `To` doesn't match any tenant or
-    isn't present, we leave g.tenant_id unset and the fallback chain in
-    tenant_context handles it (current_user.tenant_id, then pc_reps).
+    If neither matches, we leave g.tenant_id unset and current_tenant_id()
+    falls back to current_user.tenant_id (authenticated routes) or pc_reps.
     """
     from flask import g
 
-    # Only Twilio POSTs include a "To" form field. Skip GETs and non-form requests fast.
     if request.method != "POST":
         return None
 
+    # 1. Inbound: To = our number → matching tenant
     to_number = request.values.get("To") or request.form.get("To")
-    if not to_number:
-        return None
+    if to_number:
+        try:
+            tenant = tenant_by_phone(to_number)
+        except Exception as e:
+            print(f"⚠️ tenant_by_phone failed for To={to_number}: {e}")
+            tenant = None
+        if tenant:
+            g.tenant_id = tenant["id"]
+            if tenant["slug"] != "pc_reps":
+                print(f"🏢 Tenant routed: To={to_number} → {tenant['slug']}")
+            return None
 
-    try:
-        tenant = tenant_by_phone(to_number)
-    except Exception as e:
-        print(f"⚠️ tenant lookup failed for To={to_number}: {e}")
-        return None
-
-    if tenant:
-        g.tenant_id = tenant["id"]
-        # Quiet log so we can audit routing without flooding (skip if it's the
-        # PC Reps default — that's the bulk of historical traffic and noisy).
-        if tenant["slug"] != "pc_reps":
-            print(f"🏢 Tenant routed: To={to_number} → {tenant['slug']}")
+    # 2. Outbound: From = client:<employee_id> → user → tenant
+    from_field = request.values.get("From") or request.form.get("From") or ""
+    if from_field.startswith("client:"):
+        identity = from_field[len("client:"):]
+        try:
+            tid = tenant_id_for_employee_id(identity)
+        except Exception as e:
+            print(f"⚠️ tenant_id_for_employee_id failed for From={from_field}: {e}")
+            tid = None
+        if tid:
+            g.tenant_id = tid
 
     return None
 
@@ -255,7 +266,13 @@ def voice_token():
 def call_flow():
     response = VoiceResponse()
     to_number = request.values.get("To")
-    caller_id = os.getenv("TWILIO_CALLER_ID", "+17754602190")
+
+    # caller_id comes from the originating tenant (set by
+    # resolve_tenant_from_webhook via the From=client:<identity> path).
+    # Falls back through current_tenant() → pc_reps if the From identity
+    # didn't match any user (defensive).
+    caller_id = current_tenant().get("phone_number") \
+        or os.getenv("TWILIO_CALLER_ID", "+17754602190")
 
     if not to_number:
         return "Missing 'To' number", 400
@@ -363,7 +380,10 @@ def transfer_twiml():
     """Generate TwiML to connect a call to the target agent.
     Called by Twilio when a call is being transferred."""
     target = request.values.get("target")
-    caller_id = os.getenv("TWILIO_CALLER_ID", "+17754602190")
+    # Tenant-aware caller_id (set via Phase 3 webhook router).
+    # Falls back to env var, then PC Reps default.
+    caller_id = current_tenant().get("phone_number") \
+        or os.getenv("TWILIO_CALLER_ID", "+17754602190")
 
     if not target:
         response = VoiceResponse()

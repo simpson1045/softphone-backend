@@ -16,7 +16,7 @@ from psycopg2.extras import RealDictCursor
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
 from twilio_security import validate_twilio_request
-from tenant_context import current_tenant_id
+from tenant_context import current_tenant_id, current_tenant
 
 pacific = timezone("US/Pacific")
 messaging_bp = Blueprint("messaging", __name__)
@@ -204,7 +204,7 @@ def send_status_auto_reply(phone_number):
         # Send the status message
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-        sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
+        sms_from_number = current_tenant().get("phone_number") or os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
 
         if not account_sid or not auth_token:
             return False
@@ -330,7 +330,7 @@ def send_closed_day_text_reply(phone_number):
         # Send the closed-day message
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-        sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
+        sms_from_number = current_tenant().get("phone_number") or os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
 
         if not account_sid or not auth_token:
             return False
@@ -553,7 +553,7 @@ def message_status_callback():
 def send_sms():
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
+    sms_from_number = current_tenant().get("phone_number") or os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
 
     if not account_sid or not auth_token:
         return jsonify({"error": "Twilio credentials are missing"}), 500
@@ -875,7 +875,7 @@ def external_send_sms():
     # Get Twilio credentials
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
+    sms_from_number = current_tenant().get("phone_number") or os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
 
     if not account_sid or not auth_token:
         return (
