@@ -4,6 +4,12 @@ Multi-tenant bridge migration: introduces a `tenants` table and adds
 PC Reps tenant. Also creates `softphone_users` for HaniTech logins
 (PC Reps continues to auth via NovaCore for now — see auth.py).
 
+Each tenant has a `contact_provider`:
+    'novacore' — contacts come from the NovaCore customers DB (PC Reps)
+    'native'   — contacts live in this DB's `contacts` table (HaniTech)
+The local `contacts` table picks up `tenant_id` so a future contact
+adapter can route reads/writes by tenant (Phase 1c).
+
 Idempotent: re-running is safe. Uses a single transaction — partial
 failure rolls back cleanly.
 
@@ -99,6 +105,11 @@ def migrate():
 
     try:
         # ── 1. tenants table ───────────────────────────────────────────────
+        # contact_provider:
+        #   'novacore' → contacts read from the NovaCore customers DB
+        #                (PC Reps; NovaCore is PC Reps' shop ticketing system)
+        #   'native'   → contacts live in this DB's local `contacts` table
+        #                (HaniTech and any future tenant without an external CRM)
         print("\n[1/5] Creating tenants table…")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS tenants (
@@ -106,21 +117,22 @@ def migrate():
                 slug VARCHAR(50) UNIQUE NOT NULL,
                 name VARCHAR(200) NOT NULL,
                 phone_number VARCHAR(20) UNIQUE NOT NULL,
+                contact_provider VARCHAR(20) NOT NULL DEFAULT 'native',
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
 
         cur.execute("""
-            INSERT INTO tenants (slug, name, phone_number) VALUES
-                ('pc_reps', 'PC Reps', '+17754602190'),
-                ('hanitech', 'HaniTech Solutions', '+17756185775')
+            INSERT INTO tenants (slug, name, phone_number, contact_provider) VALUES
+                ('pc_reps',  'PC Reps',            '+17754602190', 'novacore'),
+                ('hanitech', 'HaniTech Solutions', '+17756185775', 'native')
             ON CONFLICT (slug) DO NOTHING
         """)
 
-        cur.execute("SELECT id, slug, name, phone_number FROM tenants ORDER BY id")
+        cur.execute("SELECT id, slug, name, phone_number, contact_provider FROM tenants ORDER BY id")
         tenants = cur.fetchall()
         for t in tenants:
-            print(f"   tenant {t['id']}: {t['slug']} ({t['name']}) → {t['phone_number']}")
+            print(f"   tenant {t['id']}: {t['slug']} ({t['name']}) → {t['phone_number']} [contacts: {t['contact_provider']}]")
 
         cur.execute("SELECT id FROM tenants WHERE slug = 'pc_reps'")
         pc_reps_id = cur.fetchone()["id"]
