@@ -364,13 +364,16 @@ def send_closed_day_text_reply(phone_number):
 
         client = Client(account_sid, auth_token)
 
-        # Fetch closed message template from database
-        default_closed = "Hi, this is PC Reps 👋 We're currently closed (open Tue, Thu, Sat 10–6). For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
+        # Fetch closed message template from database (tenant-scoped)
+        tname = current_tenant().get("name", "us")
+        default_closed = f"Hi, this is {tname} 👋 We're currently closed. For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
 
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_closed_message'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'auto_sms_closed_message' AND tenant_id = %s",
+            (current_tenant_id(),),
         )
         row = cur.fetchone()
         conn.close()

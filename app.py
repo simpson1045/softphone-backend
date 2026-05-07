@@ -1691,8 +1691,9 @@ def preview_greeting():
         if active_greeting["type"] == "auto":
             # Auto mode - depends on current time
             # Fetch templates from database
-            default_open = "Hi, this is PC Reps 👋 For the fastest response, just reply to this text with your question. Hours: Tue, Thu, Sat 10–6. Walk-ins welcome. Reply STOP to opt out."
-            default_closed = "Hi, this is PC Reps 👋 We're currently closed (open Tue, Thu, Sat 10–6). For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
+            tname = current_tenant().get("name", "us")
+            default_open = f"Hi, this is {tname} 👋 For the fastest response, just reply to this text with your question. Reply STOP to opt out."
+            default_closed = f"Hi, this is {tname} 👋 We're currently closed. For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
 
             cur.execute(
                 "SELECT setting_value FROM app_settings "
@@ -2140,9 +2141,10 @@ def auto_sms_templates():
             closed_row = cur.fetchone()
             conn.close()
 
-            # Default messages if not set
-            default_open = "Hi, this is PC Reps 👋 For the fastest response, just reply to this text with your question. Hours: Tue, Thu, Sat 10–6. Walk-ins welcome. Reply STOP to opt out."
-            default_closed = "Hi, this is PC Reps 👋 We're currently closed (open Tue, Thu, Sat 10–6). For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
+            # Default messages if not set — branded per tenant
+            tname = current_tenant().get("name", "us")
+            default_open = f"Hi, this is {tname} 👋 For the fastest response, just reply to this text with your question. Reply STOP to opt out."
+            default_closed = f"Hi, this is {tname} 👋 We're currently closed. For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
 
             return jsonify(
                 {
