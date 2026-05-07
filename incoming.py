@@ -12,6 +12,7 @@ from messaging import log_message
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
 from twilio_security import validate_twilio_request
+from tenant_context import current_tenant_id
 
 incoming_bp = Blueprint("incoming", __name__)
 pacific = timezone("US/Pacific")
@@ -53,8 +54,9 @@ def should_suppress_auto_sms(phone_number):
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT suppress_auto_sms FROM sms_preferences WHERE phone_number = ?",
-            (normalized_phone,),
+            "SELECT suppress_auto_sms FROM sms_preferences "
+            "WHERE phone_number = ? AND tenant_id = ?",
+            (normalized_phone, current_tenant_id()),
         )
         row = cur.fetchone()
         conn.close()
@@ -82,14 +84,15 @@ def is_in_auto_sms_cooldown(phone_number):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT timestamp FROM messages 
-            WHERE phone_number = ? 
-            AND direction = 'outbound' 
+            SELECT timestamp FROM messages
+            WHERE phone_number = ?
+            AND direction = 'outbound'
             AND is_auto_sms = 1
             AND timestamp > ?
+            AND tenant_id = ?
             ORDER BY timestamp DESC LIMIT 1
         """,
-            (normalized_phone, cutoff_time),
+            (normalized_phone, cutoff_time, current_tenant_id()),
         )
 
         row = cur.fetchone()
@@ -121,13 +124,14 @@ def has_recent_stop_message(phone_number):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT body FROM messages 
-            WHERE phone_number = ? 
-            AND direction = 'inbound' 
+            SELECT body FROM messages
+            WHERE phone_number = ?
+            AND direction = 'inbound'
             AND timestamp > ?
+            AND tenant_id = ?
             ORDER BY timestamp DESC
         """,
-            (normalized_phone, week_ago),
+            (normalized_phone, week_ago, current_tenant_id()),
         )
 
         recent_messages = cur.fetchall()
@@ -162,11 +166,12 @@ def log_auto_sms_attempt(
         cur.execute(
             """
             INSERT INTO auto_sms_log (
-                phone_number, call_log_id, message_id, sent_at, 
+                tenant_id, phone_number, call_log_id, message_id, sent_at,
                 cooldown_until, status, reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
+                current_tenant_id(),
                 normalized_phone,
                 call_log_id,
                 message_id,
@@ -194,7 +199,9 @@ def is_open_now(phone_number=None):
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT setting_value FROM app_settings WHERE setting_key = 'debug_mode_enabled'"
+                    "SELECT setting_value FROM app_settings "
+                    "WHERE setting_key = 'debug_mode_enabled' AND tenant_id = ?",
+                    (current_tenant_id(),),
                 )
                 row = cur.fetchone()
                 conn.close()
@@ -217,9 +224,11 @@ def is_open_now(phone_number=None):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT setting_key, setting_value FROM app_settings 
+            SELECT setting_key, setting_value FROM app_settings
             WHERE setting_key IN ('business_open_time', 'business_close_time', 'business_days')
-        """
+              AND tenant_id = ?
+        """,
+            (current_tenant_id(),),
         )
         rows = cur.fetchall()
         conn.close()
@@ -318,12 +327,17 @@ def send_auto_sms(phone_number, call_log_id=None):
             # Fetch templates from database
             conn = get_db_connection()
             cur = conn.cursor()
+            tid = current_tenant_id()
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_open_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_open_message' AND tenant_id = ?",
+                (tid,),
             )
             open_row = cur.fetchone()
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_closed_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_closed_message' AND tenant_id = ?",
+                (tid,),
             )
             closed_row = cur.fetchone()
             conn.close()
@@ -463,12 +477,13 @@ def log_call_to_db(call_data, user_id=None):
         cur.execute(
             """
             INSERT INTO call_log (
-                phone_number, direction, status, call_type, 
+                tenant_id, phone_number, direction, status, call_type,
                 caller_name, twilio_call_sid, timestamp, user_id
-            ) VALUES (?, 'inbound', ?, 'voice', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'inbound', ?, 'voice', ?, ?, ?, ?)
             RETURNING id
         """,
             (
+                current_tenant_id(),
                 normalized_phone,
                 call_data["status"],
                 contact_name,
@@ -498,7 +513,9 @@ def log_call_to_db(call_data, user_id=None):
                 if socketio:
                     # Get current missed call count
                     cur.execute(
-                        "SELECT COUNT(*) as cnt FROM call_log WHERE status LIKE '%missed%'"
+                        "SELECT COUNT(*) as cnt FROM call_log "
+                        "WHERE status LIKE '%missed%' AND tenant_id = ?",
+                        (current_tenant_id(),),
                     )
                     row = cur.fetchone()
                     missed_count = row["cnt"] if row else 0
@@ -523,7 +540,9 @@ def get_dnd_status():
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'dnd_enabled'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'dnd_enabled' AND tenant_id = ?",
+            (current_tenant_id(),),
         )
         row = cur.fetchone()
         conn.close()
@@ -538,14 +557,21 @@ def get_active_greeting():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM greetings WHERE is_active = 1 LIMIT 1")
+        tid = current_tenant_id()
+        cur.execute(
+            "SELECT * FROM greetings WHERE is_active = 1 AND tenant_id = ? LIMIT 1",
+            (tid,),
+        )
         row = cur.fetchone()
         if row:
             conn.close()
             return dict(row)
         else:
             # Fallback to closed greeting if no active greeting found
-            cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+            cur.execute(
+                "SELECT * FROM greetings WHERE type = 'closed' AND tenant_id = ? LIMIT 1",
+                (tid,),
+            )
             row = cur.fetchone()
             conn.close()
             return dict(row) if row else None
@@ -562,7 +588,9 @@ def get_default_operator_identity():
 
         # Get default operator user_id from settings
         cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'default_operator_user_id'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'default_operator_user_id' AND tenant_id = ?",
+            (current_tenant_id(),),
         )
         setting_row = cur.fetchone()
         conn.close()
@@ -611,7 +639,9 @@ def incoming():
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'dnd_enabled'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'dnd_enabled' AND tenant_id = ?",
+            (current_tenant_id(),),
         )
         row = cur.fetchone()
         conn.close()
@@ -632,7 +662,10 @@ def incoming():
                 print("🔇 DND + Auto Mode (Open Hours)")
                 conn = get_db_connection()
                 cur = conn.cursor()
-                cur.execute("SELECT * FROM greetings WHERE type = 'open' LIMIT 1")
+                cur.execute(
+                    "SELECT * FROM greetings WHERE type = 'open' AND tenant_id = ? LIMIT 1",
+                    (current_tenant_id(),),
+                )
                 open_greeting = cur.fetchone()
                 conn.close()
 
@@ -646,7 +679,10 @@ def incoming():
                 print("🔇 DND + Auto Mode (Closed Hours)")
                 conn = get_db_connection()
                 cur = conn.cursor()
-                cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+                cur.execute(
+                    "SELECT * FROM greetings WHERE type = 'closed' AND tenant_id = ? LIMIT 1",
+                    (current_tenant_id(),),
+                )
                 closed_greeting = cur.fetchone()
                 conn.close()
 
@@ -753,7 +789,10 @@ def incoming():
             # Use the "closed" greeting settings
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+            cur.execute(
+                "SELECT * FROM greetings WHERE type = 'closed' AND tenant_id = ? LIMIT 1",
+                (current_tenant_id(),),
+            )
             closed_greeting = cur.fetchone()
             conn.close()
 
@@ -901,7 +940,9 @@ def dial_status():
         user_id = None
         if status == "completed":
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'default_operator_user_id'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'default_operator_user_id' AND tenant_id = ?",
+                (current_tenant_id(),),
             )
             setting_row = cur.fetchone()
             if setting_row:
@@ -932,7 +973,10 @@ def dial_status():
             # Use open greeting for missed calls during open hours
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM greetings WHERE type = 'open' LIMIT 1")
+            cur.execute(
+                "SELECT * FROM greetings WHERE type = 'open' AND tenant_id = ? LIMIT 1",
+                (current_tenant_id(),),
+            )
             open_greeting = cur.fetchone()
             conn.close()
 
@@ -1020,11 +1064,11 @@ def call_status():
                     cur.execute(
                         """
                         INSERT INTO call_log (
-                            phone_number, direction, status, call_type,
+                            tenant_id, phone_number, direction, status, call_type,
                             caller_name, twilio_call_sid, timestamp
-                        ) VALUES (?, 'inbound', 'completed', 'voice', ?, ?, ?)
+                        ) VALUES (?, ?, 'inbound', 'completed', 'voice', ?, ?, ?)
                     """,
-                        (normalized_phone, contact_name, call_sid, timestamp),
+                        (current_tenant_id(), normalized_phone, contact_name, call_sid, timestamp),
                     )
                     conn.commit()
                 conn.close()
@@ -1048,12 +1092,13 @@ def has_recent_conversation(phone_number, hours=720):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT COUNT(*) as cnt FROM messages 
-            WHERE phone_number = ? 
+            SELECT COUNT(*) as cnt FROM messages
+            WHERE phone_number = ?
             AND timestamp > ?
             AND is_auto_sms = 0
+            AND tenant_id = ?
         """,
-            (normalized_phone, cutoff_time),
+            (normalized_phone, cutoff_time, current_tenant_id()),
         )
 
         row = cur.fetchone()
