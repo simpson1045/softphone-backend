@@ -15,6 +15,19 @@ from database import get_db_connection
 # _strip_to_digits is provider-agnostic and re-exported from novacore_contacts.
 from contact_provider import fetch_all_customers, search_customers, _strip_to_digits
 from tenant_context import current_tenant_id, current_tenant
+from phone_utils import normalize_phone_number
+
+
+def _norm_phone(value):
+    """Normalize a user-entered phone to E.164 (+1XXXXXXXXXX) when possible.
+
+    Preserves the original string if normalize_phone_number can't parse it
+    (e.g. international, short codes, or empty). The frontend formatter
+    `formatPhoneNumber` then handles display.
+    """
+    if not value:
+        return None
+    return normalize_phone_number(value) or value
 
 
 def _is_novacore_tenant():
@@ -104,24 +117,25 @@ def search_contacts_route():
 #                                           by tenant_id.
 
 
-_READ_ONLY_RESPONSE = (
-    jsonify({
+def _read_only_response():
+    """503 used by all four write endpoints when the current tenant uses
+    an external CRM (NovaCore). Built at request time, not import time —
+    `jsonify` needs a Flask app context."""
+    return jsonify({
         "error": "Contact creation/editing for this tenant is managed externally (NovaCore).",
         "status": "read_only",
-    }),
-    503,
-)
+    }), 503
 
 
 @address_book_bp.route("/address-book/add", methods=["POST"])
 def add_contact():
     if _is_novacore_tenant():
-        return _READ_ONLY_RESPONSE
+        return _read_only_response()
 
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
-    phone_primary = (data.get("phone_primary") or data.get("phone") or "").strip() or None
-    phone_secondary = (data.get("phone_secondary") or "").strip() or None
+    phone_primary = _norm_phone((data.get("phone_primary") or data.get("phone") or "").strip())
+    phone_secondary = _norm_phone((data.get("phone_secondary") or "").strip())
     company = (data.get("company") or "").strip() or None
     email = (data.get("email") or "").strip() or None
     address = (data.get("address") or "").strip() or None
@@ -169,7 +183,7 @@ def add_contact():
 @address_book_bp.route("/address-book/update/<int:contact_id>", methods=["POST"])
 def update_contact(contact_id):
     if _is_novacore_tenant():
-        return _READ_ONLY_RESPONSE
+        return _read_only_response()
 
     data = request.get_json(silent=True) or {}
 
@@ -181,6 +195,9 @@ def update_contact(contact_id):
         if col in data:
             fields.append(f"{col} = ?")
             value = (data.get(col) or "").strip() or None
+            # Normalize phone columns to E.164 on save
+            if col in ("phone_primary", "phone_secondary"):
+                value = _norm_phone(value)
             params.append(value)
             # Keep the legacy `phone` column synced with phone_primary
             if col == "phone_primary":
@@ -221,7 +238,7 @@ def update_contact(contact_id):
 @address_book_bp.route("/address-book/delete/<int:id>", methods=["POST"])
 def delete_contact(id):
     if _is_novacore_tenant():
-        return _READ_ONLY_RESPONSE
+        return _read_only_response()
 
     conn = get_db_connection()
     try:
@@ -246,7 +263,7 @@ def delete_contact(id):
 @address_book_bp.route("/address-book/delete-bulk", methods=["POST"])
 def delete_bulk_contacts():
     if _is_novacore_tenant():
-        return _READ_ONLY_RESPONSE
+        return _read_only_response()
 
     data = request.get_json(silent=True) or {}
     ids = data.get("ids") or []
