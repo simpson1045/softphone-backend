@@ -27,6 +27,7 @@ from auth import auth_bp, init_login_manager
 from database import get_db_connection
 from call_recording import call_recording_bp
 from twilio_security import validate_twilio_request
+from tenant_context import current_tenant_id
 
 import sys
 
@@ -389,11 +390,11 @@ def get_calls():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Build query with optional direction filter
-        where_clause = ""
-        params = []
+        # Build query with mandatory tenant filter + optional direction filter
+        where_clause = "WHERE tenant_id = ?"
+        params = [current_tenant_id()]
         if direction in ("inbound", "outbound"):
-            where_clause = "WHERE direction = ?"
+            where_clause += " AND direction = ?"
             params.append(direction)
 
         # Get total count for pagination info
@@ -432,7 +433,8 @@ def get_unseen_call_count():
             WHERE seen = false
             AND direction = 'inbound'
             AND status != 'completed'
-        """)
+            AND tenant_id = ?
+        """, (current_tenant_id(),))
         result = cur.fetchone()
         conn.close()
         return jsonify({"count": result["count"] if result else 0})
@@ -448,7 +450,11 @@ def mark_calls_seen():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("UPDATE call_log SET seen = true WHERE seen = false AND direction = 'inbound'")
+        cur.execute(
+            "UPDATE call_log SET seen = true "
+            "WHERE seen = false AND direction = 'inbound' AND tenant_id = ?",
+            (current_tenant_id(),),
+        )
         conn.commit()
         conn.close()
         return jsonify({"status": "ok"})
@@ -517,11 +523,12 @@ def log_outbound_call():
                 cur.execute(
                     """
                         INSERT INTO call_log (
-                            phone_number, direction, status, call_type,
+                            tenant_id, phone_number, direction, status, call_type,
                             caller_name, twilio_call_sid, timestamp, user_id
-                        ) VALUES (?, 'outbound', ?, 'voice', ?, ?, ?, ?)
+                        ) VALUES (?, ?, 'outbound', ?, 'voice', ?, ?, ?, ?)
                     """,
                     (
+                        current_tenant_id(),
                         normalized_phone,
                         status,
                         contact_name,
@@ -536,11 +543,12 @@ def log_outbound_call():
             cur.execute(
                 """
                 INSERT INTO call_log (
-                    phone_number, direction, status, call_type,
+                    tenant_id, phone_number, direction, status, call_type,
                     caller_name, twilio_call_sid, timestamp, user_id
-                ) VALUES (?, 'outbound', ?, 'voice', ?, ?, ?, ?)
+                ) VALUES (?, ?, 'outbound', ?, 'voice', ?, ?, ?, ?)
             """,
                 (
+                    current_tenant_id(),
                     normalized_phone,
                     status,
                     contact_name,
@@ -855,7 +863,10 @@ def get_greetings():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM greetings ORDER BY type, name")
+        cur.execute(
+            "SELECT * FROM greetings WHERE tenant_id = ? ORDER BY type, name",
+            (current_tenant_id(),),
+        )
         greetings = [dict(row) for row in cur.fetchall()]
         conn.close()
         return jsonify(greetings)
@@ -877,13 +888,20 @@ def set_active_greeting():
         cur = conn.cursor()
 
         # Get greeting info for logging
-        cur.execute("SELECT name, type FROM greetings WHERE id = ?", (greeting_id,))
+        tid = current_tenant_id()
+        cur.execute(
+            "SELECT name, type FROM greetings WHERE id = ? AND tenant_id = ?",
+            (greeting_id, tid),
+        )
         greeting = cur.fetchone()
 
-        # Set all greetings to inactive
-        cur.execute("UPDATE greetings SET is_active = 0")
+        # Set all greetings to inactive (within this tenant only)
+        cur.execute("UPDATE greetings SET is_active = 0 WHERE tenant_id = ?", (tid,))
         # Set the selected greeting to active
-        cur.execute("UPDATE greetings SET is_active = 1 WHERE id = ?", (greeting_id,))
+        cur.execute(
+            "UPDATE greetings SET is_active = 1 WHERE id = ? AND tenant_id = ?",
+            (greeting_id, tid),
+        )
         conn.commit()
 
         # Log the activation
@@ -907,11 +925,11 @@ def update_greeting(greeting_id):
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE greetings 
-            SET auto_sms_message = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
+            UPDATE greetings
+            SET auto_sms_message = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND tenant_id = ?
         """,
-            (auto_sms_message, greeting_id),
+            (auto_sms_message, greeting_id, current_tenant_id()),
         )
         conn.commit()
         conn.close()
@@ -935,7 +953,10 @@ def upload_greeting_audio(greeting_id):
         # Get greeting info
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT name, type FROM greetings WHERE id = ?", (greeting_id,))
+        cur.execute(
+            "SELECT name, type FROM greetings WHERE id = ? AND tenant_id = ?",
+            (greeting_id, current_tenant_id()),
+        )
         greeting = cur.fetchone()
 
         if not greeting:
@@ -1023,11 +1044,11 @@ def upload_greeting_audio(greeting_id):
 
         cur.execute(
             """
-            UPDATE greetings 
-            SET audio_url = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
+            UPDATE greetings
+            SET audio_url = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND tenant_id = ?
         """,
-            (audio_url, greeting_id),
+            (audio_url, greeting_id, current_tenant_id()),
         )
         conn.commit()
         conn.close()
@@ -1056,7 +1077,10 @@ def get_audio_library(greeting_id):
         # Get greeting type
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT type FROM greetings WHERE id = ?", (greeting_id,))
+        cur.execute(
+            "SELECT type FROM greetings WHERE id = ? AND tenant_id = ?",
+            (greeting_id, current_tenant_id()),
+        )
         greeting = cur.fetchone()
         conn.close()
 
@@ -1106,7 +1130,10 @@ def save_recorded_audio(greeting_id):
         # Get greeting info
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT name, type FROM greetings WHERE id = ?", (greeting_id,))
+        cur.execute(
+            "SELECT name, type FROM greetings WHERE id = ? AND tenant_id = ?",
+            (greeting_id, current_tenant_id()),
+        )
         greeting = cur.fetchone()
         conn.close()
 
@@ -1198,11 +1225,11 @@ def select_greeting_audio(greeting_id):
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE greetings 
-            SET audio_url = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
+            UPDATE greetings
+            SET audio_url = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND tenant_id = ?
         """,
-            (audio_url, greeting_id),
+            (audio_url, greeting_id, current_tenant_id()),
         )
         conn.commit()
         conn.close()
@@ -1228,9 +1255,11 @@ def vacation_dates():
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT setting_key, setting_value FROM app_settings 
+                SELECT setting_key, setting_value FROM app_settings
                 WHERE setting_key IN ('vacation_start_date', 'vacation_end_date')
-            """
+                  AND tenant_id = ?
+            """,
+                (current_tenant_id(),),
             )
             rows = cur.fetchall()
             conn.close()
@@ -1252,23 +1281,28 @@ def vacation_dates():
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # Update or insert vacation dates
+            # Update or insert vacation dates. Conflict target is the
+            # composite (tenant_id, setting_key) constraint introduced
+            # by migrate_tenants.py.
+            tid = current_tenant_id()
             cur.execute(
                 """
-                INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                VALUES ('vacation_start_date', ?, CURRENT_TIMESTAMP)
-                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                VALUES (?, 'vacation_start_date', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (tenant_id, setting_key)
+                  DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
             """,
-                (start_date, start_date),
+                (tid, start_date, start_date),
             )
 
             cur.execute(
                 """
-                INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                VALUES ('vacation_end_date', ?, CURRENT_TIMESTAMP)
-                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                VALUES (?, 'vacation_end_date', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (tenant_id, setting_key)
+                  DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
             """,
-                (end_date, end_date),
+                (tid, end_date, end_date),
             )
 
             conn.commit()
@@ -1485,48 +1519,60 @@ def save_recorded_notice():
 
 
 def check_vacation_auto_return():
-    """Check if vacation period has ended and auto-return to auto mode"""
+    """Check if vacation period has ended and auto-return to auto mode.
+
+    Runs in a daemon thread (no Flask request context). Iterates over
+    every tenant individually since each tenant has its own greetings
+    + app_settings rows post-Phase 1c migration.
+    """
     try:
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Check if vacation greeting is currently active
-        cur.execute(
-            "SELECT * FROM greetings WHERE is_active = 1 AND type = 'vacation' LIMIT 1"
-        )
-        active_vacation = cur.fetchone()
+        cur.execute("SELECT id, slug FROM tenants")
+        all_tenants = cur.fetchall()
 
-        if not active_vacation:
-            conn.close()
-            return  # Not in vacation mode
+        for tenant in all_tenants:
+            tid = tenant["id"]
 
-        # Get vacation end date
-        cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'vacation_end_date'"
-        )
-        end_date_row = cur.fetchone()
-
-        if not end_date_row or not end_date_row["setting_value"]:
-            conn.close()
-            return  # No end date set
-
-        # Check if vacation period has ended
-        end_date = datetime.fromisoformat(end_date_row["setting_value"])
-        now = datetime.now()
-
-        if now.date() > end_date.date():
-            # Vacation period has ended, switch to auto mode
-            cur.execute("UPDATE greetings SET is_active = 0")  # Deactivate all
+            # Check if vacation greeting is currently active for this tenant
             cur.execute(
-                "UPDATE greetings SET is_active = 1 WHERE type = 'auto'"
-            )  # Activate auto
-            conn.commit()
-            conn.close()
-
-            print(
-                f"🔄 Auto-return: Vacation ended on {end_date.date()}, switched back to Auto Mode"
+                "SELECT * FROM greetings WHERE is_active = 1 AND type = 'vacation' "
+                "AND tenant_id = ? LIMIT 1",
+                (tid,),
             )
-            return True
+            active_vacation = cur.fetchone()
+            if not active_vacation:
+                continue  # not in vacation mode for this tenant
+
+            # Get vacation end date for this tenant
+            cur.execute(
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'vacation_end_date' AND tenant_id = ?",
+                (tid,),
+            )
+            end_date_row = cur.fetchone()
+            if not end_date_row or not end_date_row["setting_value"]:
+                continue  # no end date set for this tenant
+
+            end_date = datetime.fromisoformat(end_date_row["setting_value"])
+            now = datetime.now()
+
+            if now.date() > end_date.date():
+                # Vacation period has ended for this tenant — switch to auto mode
+                cur.execute(
+                    "UPDATE greetings SET is_active = 0 WHERE tenant_id = ?",
+                    (tid,),
+                )
+                cur.execute(
+                    "UPDATE greetings SET is_active = 1 WHERE type = 'auto' AND tenant_id = ?",
+                    (tid,),
+                )
+                conn.commit()
+                print(
+                    f"🔄 Auto-return [{tenant['slug']}]: Vacation ended on {end_date.date()}, "
+                    "switched back to Auto Mode"
+                )
 
         conn.close()
 
@@ -1564,7 +1610,11 @@ def preview_greeting():
         # Get current active greeting
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM greetings WHERE is_active = 1 LIMIT 1")
+        tid = current_tenant_id()
+        cur.execute(
+            "SELECT * FROM greetings WHERE is_active = 1 AND tenant_id = ? LIMIT 1",
+            (tid,),
+        )
         active_greeting = cur.fetchone()
 
         if not active_greeting:
@@ -1585,11 +1635,15 @@ def preview_greeting():
             default_closed = "Hi, this is PC Reps 👋 We're currently closed (open Tue, Thu, Sat 10–6). For the fastest response, text us your question and we'll get back to you when we open! Reply STOP to opt out."
 
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_open_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_open_message' AND tenant_id = ?",
+                (tid,),
             )
             open_row = cur.fetchone()
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_closed_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_closed_message' AND tenant_id = ?",
+                (tid,),
             )
             closed_row = cur.fetchone()
 
@@ -1600,7 +1654,10 @@ def preview_greeting():
 
             if is_open_now():
                 # Get open greeting
-                cur.execute("SELECT * FROM greetings WHERE type = 'open' LIMIT 1")
+                cur.execute(
+                    "SELECT * FROM greetings WHERE type = 'open' AND tenant_id = ? LIMIT 1",
+                    (tid,),
+                )
                 open_greeting = cur.fetchone()
                 preview_data.update(
                     {
@@ -1615,7 +1672,10 @@ def preview_greeting():
                 )
             else:
                 # Get closed greeting
-                cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+                cur.execute(
+                    "SELECT * FROM greetings WHERE type = 'closed' AND tenant_id = ? LIMIT 1",
+                    (tid,),
+                )
                 closed_greeting = cur.fetchone()
                 preview_data.update(
                     {
@@ -1688,16 +1748,18 @@ def get_analytics():
         tables = [row["table_name"] for row in cur.fetchall()]
         print(f"📊 Available tables: {tables}")
 
+        tid = current_tenant_id()
+
         # Get call statistics
         try:
             cur.execute(
                 """
                 SELECT status, COUNT(*) as count
-                FROM call_log 
-                WHERE timestamp > ? 
+                FROM call_log
+                WHERE timestamp > ? AND tenant_id = ?
                 GROUP BY status
             """,
-                (cutoff_date,),
+                (cutoff_date, tid),
             )
             calls_data = dict(cur.fetchall())
             total_calls = sum(calls_data.values())
@@ -1712,12 +1774,13 @@ def get_analytics():
             cur.execute(
                 """
                 SELECT COUNT(*) as count
-                FROM messages 
-                WHERE direction = 'outbound' 
-                AND is_auto_sms = 1 
+                FROM messages
+                WHERE direction = 'outbound'
+                AND is_auto_sms = 1
                 AND timestamp > ?
+                AND tenant_id = ?
             """,
-                (cutoff_date,),
+                (cutoff_date, tid),
             )
             total_auto_sms = cur.fetchone()["count"]
             print(f"📊 Auto SMS count: {total_auto_sms}")
@@ -1739,13 +1802,14 @@ def get_analytics():
                         ELSE 'other'
                     END as type,
                     COUNT(*) as count
-                FROM messages 
-                WHERE direction = 'outbound' 
-                AND is_auto_sms = 1 
+                FROM messages
+                WHERE direction = 'outbound'
+                AND is_auto_sms = 1
                 AND timestamp > ?
+                AND tenant_id = ?
                 GROUP BY type
             """,
-                (cutoff_date,),
+                (cutoff_date, tid),
             )
             sms_data = dict(cur.fetchall())
             print(f"📊 SMS breakdown: {sms_data}")
@@ -1763,12 +1827,13 @@ def get_analytics():
                 cur.execute(
                     """
                     SELECT greeting_type, COUNT(*) as count
-                    FROM greeting_analytics 
-                    WHERE event_type = 'activated' 
+                    FROM greeting_analytics
+                    WHERE event_type = 'activated'
                     AND timestamp > ?
+                    AND tenant_id = ?
                     GROUP BY greeting_type
                 """,
-                    (cutoff_date,),
+                    (cutoff_date, tid),
                 )
                 activation_data = dict(cur.fetchall())
                 total_activations = sum(activation_data.values())
@@ -1776,13 +1841,14 @@ def get_analytics():
                 cur.execute(
                     """
                     SELECT greeting_name, timestamp
-                    FROM greeting_analytics 
-                    WHERE event_type = 'activated' 
+                    FROM greeting_analytics
+                    WHERE event_type = 'activated'
                     AND timestamp > ?
-                    ORDER BY timestamp DESC 
+                    AND tenant_id = ?
+                    ORDER BY timestamp DESC
                     LIMIT 5
                 """,
-                    (cutoff_date,),
+                    (cutoff_date, tid),
                 )
                 recent_activations = [dict(row) for row in cur.fetchall()]
                 print(
@@ -1884,8 +1950,12 @@ def add_dnd_greeting():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Check if DND greeting already exists
-        cursor.execute("SELECT id FROM greetings WHERE type = 'dnd' LIMIT 1")
+        # Check if DND greeting already exists for this tenant
+        tid = current_tenant_id()
+        cursor.execute(
+            "SELECT id FROM greetings WHERE type = 'dnd' AND tenant_id = ? LIMIT 1",
+            (tid,),
+        )
         existing = cursor.fetchone()
 
         if existing:
@@ -1894,14 +1964,15 @@ def add_dnd_greeting():
                 {"message": "DND greeting already exists", "id": existing["id"]}
             )
 
-        # Add DND greeting
+        # Add DND greeting for this tenant
         cursor.execute(
             """
-            INSERT INTO greetings (type, name, auto_sms_message, audio_url, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO greetings (tenant_id, type, name, auto_sms_message, audio_url, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             RETURNING id
         """,
             (
+                tid,
                 "dnd",
                 "Do Not Disturb",
                 "Smart DND mode - uses open/closed SMS based on hours",
@@ -1932,7 +2003,9 @@ def dnd_setting():
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'dnd_enabled'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'dnd_enabled' AND tenant_id = ?",
+                (current_tenant_id(),),
             )
             row = cur.fetchone()
             conn.close()
@@ -1948,11 +2021,12 @@ def dnd_setting():
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                VALUES ('dnd_enabled', ?, CURRENT_TIMESTAMP)
-                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                VALUES (?, 'dnd_enabled', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (tenant_id, setting_key)
+                  DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
             """,
-                (str(int(dnd_enabled)), str(int(dnd_enabled))),
+                (current_tenant_id(), str(int(dnd_enabled)), str(int(dnd_enabled))),
             )
             conn.commit()
             conn.close()
@@ -1971,15 +2045,21 @@ def auto_sms_templates():
             conn = get_db_connection()
             cur = conn.cursor()
 
+            tid = current_tenant_id()
+
             # Get open hours template
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_open_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_open_message' AND tenant_id = ?",
+                (tid,),
             )
             open_row = cur.fetchone()
 
             # Get closed hours template
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_closed_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_closed_message' AND tenant_id = ?",
+                (tid,),
             )
             closed_row = cur.fetchone()
             conn.close()
@@ -2007,24 +2087,28 @@ def auto_sms_templates():
             conn = get_db_connection()
             cur = conn.cursor()
 
+            tid = current_tenant_id()
+
             if open_message is not None:
                 cur.execute(
                     """
-                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                    VALUES ('auto_sms_open_message', ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                    INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                    VALUES (?, 'auto_sms_open_message', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (tenant_id, setting_key)
+                      DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
                 """,
-                    (open_message, open_message),
+                    (tid, open_message, open_message),
                 )
 
             if closed_message is not None:
                 cur.execute(
                     """
-                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                    VALUES ('auto_sms_closed_message', ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                    INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                    VALUES (?, 'auto_sms_closed_message', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (tenant_id, setting_key)
+                      DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
                 """,
-                    (closed_message, closed_message),
+                    (tid, closed_message, closed_message),
                 )
 
             conn.commit()
@@ -2044,7 +2128,9 @@ def message_templates_collection():
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, name, content, category FROM message_templates ORDER BY category, name"
+                "SELECT id, name, content, category FROM message_templates "
+                "WHERE tenant_id = ? ORDER BY category, name",
+                (current_tenant_id(),),
             )
             rows = cur.fetchall()
             conn.close()
@@ -2062,11 +2148,11 @@ def message_templates_collection():
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO message_templates (name, content, category)
-            VALUES (?, ?, ?)
+            INSERT INTO message_templates (tenant_id, name, content, category)
+            VALUES (?, ?, ?, ?)
             RETURNING id, name, content, category
             """,
-            (name, content, category),
+            (current_tenant_id(), name, content, category),
         )
         row = cur.fetchone()
         conn.commit()
@@ -2084,7 +2170,10 @@ def message_templates_item(template_id):
         if request.method == "DELETE":
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("DELETE FROM message_templates WHERE id = ?", (template_id,))
+            cur.execute(
+                "DELETE FROM message_templates WHERE id = ? AND tenant_id = ?",
+                (template_id, current_tenant_id()),
+            )
             deleted = cur.rowcount
             conn.commit()
             conn.close()
@@ -2106,10 +2195,10 @@ def message_templates_item(template_id):
             """
             UPDATE message_templates
                SET name = ?, content = ?, category = ?, updated_at = NOW()
-             WHERE id = ?
+             WHERE id = ? AND tenant_id = ?
          RETURNING id, name, content, category
             """,
-            (name, content, category, template_id),
+            (name, content, category, template_id, current_tenant_id()),
         )
         row = cur.fetchone()
         conn.commit()
@@ -2128,7 +2217,10 @@ def remove_old_dnd_greeting():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM greetings WHERE type = 'dnd'")
+        cursor.execute(
+            "DELETE FROM greetings WHERE type = 'dnd' AND tenant_id = ?",
+            (current_tenant_id(),),
+        )
         deleted_count = cursor.rowcount
         conn.commit()
         conn.close()
@@ -2177,7 +2269,9 @@ def debug_setting():
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'debug_mode_enabled'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'debug_mode_enabled' AND tenant_id = ?",
+                (current_tenant_id(),),
             )
             row = cur.fetchone()
             conn.close()
@@ -2193,11 +2287,12 @@ def debug_setting():
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                VALUES ('debug_mode_enabled', ?, CURRENT_TIMESTAMP)
-                ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                VALUES (?, 'debug_mode_enabled', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (tenant_id, setting_key)
+                  DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
             """,
-                (str(int(debug_enabled)), str(int(debug_enabled))),
+                (current_tenant_id(), str(int(debug_enabled)), str(int(debug_enabled))),
             )
             conn.commit()
             conn.close()
@@ -2215,7 +2310,9 @@ def get_default_operator():
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'default_operator_user_id'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'default_operator_user_id' AND tenant_id = ?",
+            (current_tenant_id(),),
         )
         row = cursor.fetchone()
         conn.close()
@@ -2243,11 +2340,12 @@ def set_default_operator():
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO app_settings (setting_key, setting_value, updated_at)
-            VALUES ('default_operator_user_id', ?, CURRENT_TIMESTAMP)
-            ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+            INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+            VALUES (?, 'default_operator_user_id', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (tenant_id, setting_key)
+              DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
         """,
-            (str(user_id), str(user_id)),
+            (current_tenant_id(), str(user_id), str(user_id)),
         )
         conn.commit()
         conn.close()
@@ -2269,9 +2367,11 @@ def business_hours():
             # Get all business hour settings
             cur.execute(
                 """
-                SELECT setting_key, setting_value FROM app_settings 
+                SELECT setting_key, setting_value FROM app_settings
                 WHERE setting_key IN ('business_open_time', 'business_close_time', 'business_days')
-            """
+                  AND tenant_id = ?
+            """,
+                (current_tenant_id(),),
             )
             rows = cur.fetchall()
             conn.close()
@@ -2298,34 +2398,39 @@ def business_hours():
             conn = get_db_connection()
             cur = conn.cursor()
 
+            tid = current_tenant_id()
+
             if "open_time" in data:
                 cur.execute(
                     """
-                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                    VALUES ('business_open_time', ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                    INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                    VALUES (?, 'business_open_time', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (tenant_id, setting_key)
+                      DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
                 """,
-                    (data["open_time"], data["open_time"]),
+                    (tid, data["open_time"], data["open_time"]),
                 )
 
             if "close_time" in data:
                 cur.execute(
                     """
-                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                    VALUES ('business_close_time', ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                    INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                    VALUES (?, 'business_close_time', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (tenant_id, setting_key)
+                      DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
                 """,
-                    (data["close_time"], data["close_time"]),
+                    (tid, data["close_time"], data["close_time"]),
                 )
 
             if "days" in data:
                 cur.execute(
                     """
-                    INSERT INTO app_settings (setting_key, setting_value, updated_at)
-                    VALUES ('business_days', ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT (setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
+                    INSERT INTO app_settings (tenant_id, setting_key, setting_value, updated_at)
+                    VALUES (?, 'business_days', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (tenant_id, setting_key)
+                      DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP
                 """,
-                    (data["days"], data["days"]),
+                    (tid, data["days"], data["days"]),
                 )
 
             conn.commit()
