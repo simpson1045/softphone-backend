@@ -6,6 +6,7 @@ Extracted from app.py to avoid circular imports.
 import json
 from datetime import datetime
 from database import get_db_connection
+from tenant_context import current_tenant_id
 
 
 def log_analytics_event(
@@ -18,10 +19,11 @@ def log_analytics_event(
         cur.execute(
             """
             INSERT INTO greeting_analytics
-            (greeting_type, greeting_name, event_type, phone_number, additional_data, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (tenant_id, greeting_type, greeting_name, event_type, phone_number, additional_data, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
             (
+                current_tenant_id(),
                 greeting_type,
                 greeting_name,
                 event_type,

@@ -18,6 +18,7 @@ import threading
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
 from twilio_security import validate_twilio_request
+from tenant_context import current_tenant_id
 
 load_dotenv()
 
@@ -41,7 +42,10 @@ def update_voicemail_notification_count():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0")
+        cur.execute(
+            "SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0 AND tenant_id = ?",
+            (current_tenant_id(),),
+        )
         row = cur.fetchone()
         unread_count = row["cnt"] if row else 0
         conn.close()
@@ -199,12 +203,13 @@ def save_voicemail():
         cur.execute(
             """
             INSERT INTO voicemails (
-                phone_number, caller_name, recording_sid, recording_url, 
+                tenant_id, phone_number, caller_name, recording_sid, recording_url,
                 local_filename, transcription, call_sid, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
         """,
             (
+                current_tenant_id(),
                 normalized_phone,
                 contact_name,
                 recording_sid,
@@ -309,12 +314,16 @@ def get_voicemails_json():
             # Paginated mode
             offset = (page - 1) * per_page
 
-            cur.execute("SELECT COUNT(*) as total FROM voicemails")
+            tid = current_tenant_id()
+            cur.execute(
+                "SELECT COUNT(*) as total FROM voicemails WHERE tenant_id = ?",
+                (tid,),
+            )
             total = cur.fetchone()["total"]
 
             cur.execute(
-                "SELECT * FROM voicemails ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                (per_page, offset),
+                "SELECT * FROM voicemails WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (tid, per_page, offset),
             )
             rows = cur.fetchall()
             conn.close()
@@ -336,7 +345,10 @@ def get_voicemails_json():
             })
         else:
             # Non-paginated mode (backward compatible)
-            cur.execute("SELECT * FROM voicemails ORDER BY timestamp DESC")
+            cur.execute(
+                "SELECT * FROM voicemails WHERE tenant_id = ? ORDER BY timestamp DESC",
+                (current_tenant_id(),),
+            )
             rows = cur.fetchall()
             conn.close()
 
@@ -426,7 +438,10 @@ def get_unread_voicemail_count():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0")
+        cur.execute(
+            "SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0 AND tenant_id = ?",
+            (current_tenant_id(),),
+        )
         row = cur.fetchone()
         count = row["cnt"] if row else 0
         conn.close()
@@ -459,7 +474,10 @@ def retranscribe_voicemail(voicemail_id):
         # Get voicemail info
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM voicemails WHERE id = ?", (voicemail_id,))
+        cur.execute(
+            "SELECT * FROM voicemails WHERE id = ? AND tenant_id = ?",
+            (voicemail_id, current_tenant_id()),
+        )
         voicemail = cur.fetchone()
         conn.close()
 
@@ -492,20 +510,26 @@ def get_voicemail_stats():
         conn = get_db_connection()
         cur = conn.cursor()
 
+        tid = current_tenant_id()
+
         # Total count
-        cur.execute("SELECT COUNT(*) as cnt FROM voicemails")
+        cur.execute("SELECT COUNT(*) as cnt FROM voicemails WHERE tenant_id = ?", (tid,))
         row = cur.fetchone()
         total = row["cnt"] if row else 0
 
         # Unread count
-        cur.execute("SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0")
+        cur.execute(
+            "SELECT COUNT(*) as cnt FROM voicemails WHERE is_read = 0 AND tenant_id = ?",
+            (tid,),
+        )
         row = cur.fetchone()
         unread = row["cnt"] if row else 0
 
         # Recent count (last 7 days)
         week_ago = (datetime.now() - timedelta(days=7)).isoformat()
         cur.execute(
-            "SELECT COUNT(*) as cnt FROM voicemails WHERE timestamp > ?", (week_ago,)
+            "SELECT COUNT(*) as cnt FROM voicemails WHERE timestamp > ? AND tenant_id = ?",
+            (week_ago, tid),
         )
         row = cur.fetchone()
         recent = row["cnt"] if row else 0

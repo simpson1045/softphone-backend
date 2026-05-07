@@ -1,19 +1,21 @@
 """
-Export contacts from NovaCore as CSV.
+Export contacts as CSV. Pulls from the current tenant's contact provider:
+PC Reps -> NovaCore customers, HaniTech (and future native tenants) ->
+local softphone.contacts table scoped by tenant_id.
 """
 
 from flask import Blueprint, Response
 import csv
 import io
 from datetime import datetime
-from novacore_contacts import fetch_all_customers
+from contact_provider import fetch_all_customers
 
 export_contacts_bp = Blueprint("export_contacts", __name__)
 
 
 @export_contacts_bp.route("/address-book/export", methods=["GET"])
 def export_contacts():
-    """Export all NovaCore customers as a CSV download."""
+    """Export all contacts for the current tenant as a CSV download."""
     customers = fetch_all_customers()
 
     output = io.StringIO()

@@ -4,7 +4,8 @@ import re
 import os
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
-from novacore_contacts import bulk_resolve_names
+from contact_provider import bulk_resolve_names
+from tenant_context import current_tenant_id
 
 messages_api = Blueprint("messages_api", __name__)
 
@@ -23,9 +24,9 @@ def get_thread(phone_number):
         cur.execute("""
             SELECT id, direction, body, media_urls, timestamp, status, status_reason, twilio_sid
             FROM messages
-            WHERE phone_number = ?
+            WHERE phone_number = ? AND tenant_id = ?
             ORDER BY timestamp ASC
-        """, (normalized_phone,))
+        """, (normalized_phone, current_tenant_id()))
         
         rows = cur.fetchall()
         conn.close()
@@ -63,7 +64,10 @@ def get_threads():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Single query: latest message + unread count per thread
+        # Single query: latest message + unread count per thread.
+        # tenant_id filter applied in BOTH subqueries — otherwise we'd
+        # see threads that include another tenant's messages.
+        tid = current_tenant_id()
         cur.execute("""
             SELECT
                 latest.phone_number,
@@ -75,16 +79,17 @@ def get_threads():
                 SELECT DISTINCT ON (phone_number)
                     phone_number, body, direction, timestamp
                 FROM messages
+                WHERE tenant_id = ?
                 ORDER BY phone_number, timestamp DESC
             ) latest
             LEFT JOIN (
                 SELECT phone_number, COUNT(*) AS unread_count
                 FROM messages
-                WHERE direction = 'inbound' AND read = 0
+                WHERE direction = 'inbound' AND read = 0 AND tenant_id = ?
                 GROUP BY phone_number
             ) u ON latest.phone_number = u.phone_number
             ORDER BY latest.timestamp DESC
-        """)
+        """, (tid, tid))
 
         rows = cur.fetchall()
         conn.close()
@@ -123,12 +128,15 @@ def mark_thread_read(phone_number):
             
         conn = get_db_connection()
         cur = conn.cursor()
-        # Only mark INBOUND messages as read
+        # Only mark INBOUND messages as read. tenant_id filter required:
+        # otherwise marking a PC Reps thread read could mark a HaniTech
+        # thread for the same phone_number read too.
         cur.execute("""
             UPDATE messages
             SET read = 1
             WHERE phone_number = ? AND direction = 'inbound' AND read = 0
-        """, (normalized_phone,))
+              AND tenant_id = ?
+        """, (normalized_phone, current_tenant_id()))
         updated = cur.rowcount
         conn.commit()
         conn.close()
@@ -155,8 +163,8 @@ def mark_thread_unread(phone_number):
         cur.execute("""
             UPDATE messages
             SET read = 0
-            WHERE phone_number = ? AND direction = 'inbound'
-        """, (normalized_phone,))
+            WHERE phone_number = ? AND direction = 'inbound' AND tenant_id = ?
+        """, (normalized_phone, current_tenant_id()))
         updated = cur.rowcount
         conn.commit()
         conn.close()

@@ -12,9 +12,26 @@ from messaging import log_message
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
 from twilio_security import validate_twilio_request
+from tenant_context import (
+    current_tenant_id, current_tenant,
+    set_thread_tenant_id, clear_thread_tenant_id,
+)
 
 incoming_bp = Blueprint("incoming", __name__)
 pacific = timezone("US/Pacific")
+
+
+def _play_or_say(response, audio_url,
+                 fallback_text="Please leave a message after the beep."):
+    """Add a <Play> if we have a recorded greeting URL, otherwise <Say>.
+
+    Used so a tenant with no `greetings` rows yet (e.g. brand-new
+    HaniTech) doesn't fall through to a hardcoded PC Reps mp3 URL.
+    """
+    if audio_url:
+        response.play(audio_url)
+    else:
+        response.say(fallback_text)
 
 
 def get_novacore_connection():
@@ -43,8 +60,8 @@ def should_suppress_auto_sms(phone_number):
         if not normalized_phone:
             return False
 
-        # Check NovaCore for opt_out_sms
-        from novacore_contacts import find_customer_by_phone
+        # Check the tenant's contact source for opt_out_sms
+        from contact_provider import find_customer_by_phone
         customer = find_customer_by_phone(normalized_phone)
         if customer and customer.get("opted_out_sms"):
             return True
@@ -53,8 +70,9 @@ def should_suppress_auto_sms(phone_number):
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT suppress_auto_sms FROM sms_preferences WHERE phone_number = ?",
-            (normalized_phone,),
+            "SELECT suppress_auto_sms FROM sms_preferences "
+            "WHERE phone_number = ? AND tenant_id = ?",
+            (normalized_phone, current_tenant_id()),
         )
         row = cur.fetchone()
         conn.close()
@@ -82,14 +100,15 @@ def is_in_auto_sms_cooldown(phone_number):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT timestamp FROM messages 
-            WHERE phone_number = ? 
-            AND direction = 'outbound' 
+            SELECT timestamp FROM messages
+            WHERE phone_number = ?
+            AND direction = 'outbound'
             AND is_auto_sms = 1
             AND timestamp > ?
+            AND tenant_id = ?
             ORDER BY timestamp DESC LIMIT 1
         """,
-            (normalized_phone, cutoff_time),
+            (normalized_phone, cutoff_time, current_tenant_id()),
         )
 
         row = cur.fetchone()
@@ -121,13 +140,14 @@ def has_recent_stop_message(phone_number):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT body FROM messages 
-            WHERE phone_number = ? 
-            AND direction = 'inbound' 
+            SELECT body FROM messages
+            WHERE phone_number = ?
+            AND direction = 'inbound'
             AND timestamp > ?
+            AND tenant_id = ?
             ORDER BY timestamp DESC
         """,
-            (normalized_phone, week_ago),
+            (normalized_phone, week_ago, current_tenant_id()),
         )
 
         recent_messages = cur.fetchall()
@@ -162,11 +182,12 @@ def log_auto_sms_attempt(
         cur.execute(
             """
             INSERT INTO auto_sms_log (
-                phone_number, call_log_id, message_id, sent_at, 
+                tenant_id, phone_number, call_log_id, message_id, sent_at,
                 cooldown_until, status, reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
+                current_tenant_id(),
                 normalized_phone,
                 call_log_id,
                 message_id,
@@ -194,7 +215,9 @@ def is_open_now(phone_number=None):
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT setting_value FROM app_settings WHERE setting_key = 'debug_mode_enabled'"
+                    "SELECT setting_value FROM app_settings "
+                    "WHERE setting_key = 'debug_mode_enabled' AND tenant_id = ?",
+                    (current_tenant_id(),),
                 )
                 row = cur.fetchone()
                 conn.close()
@@ -217,9 +240,11 @@ def is_open_now(phone_number=None):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT setting_key, setting_value FROM app_settings 
+            SELECT setting_key, setting_value FROM app_settings
             WHERE setting_key IN ('business_open_time', 'business_close_time', 'business_days')
-        """
+              AND tenant_id = ?
+        """,
+            (current_tenant_id(),),
         )
         rows = cur.fetchall()
         conn.close()
@@ -296,10 +321,13 @@ def send_auto_sms(phone_number, call_log_id=None):
             )
             return False
 
-        # Send the SMS
+        # Send the SMS — sms_from_number comes from the current tenant
+        # (set by Phase 3 webhook router from `To`, then propagated into
+        # this background thread by delayed_auto_sms via set_thread_tenant_id).
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-        sms_from_number = os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
+        sms_from_number = current_tenant().get("phone_number") \
+            or os.getenv("TWILIO_SMS_NUMBER", "+17754602190")
 
         if not account_sid or not auth_token:
             print("❌ Missing Twilio credentials for auto-SMS")
@@ -318,12 +346,17 @@ def send_auto_sms(phone_number, call_log_id=None):
             # Fetch templates from database
             conn = get_db_connection()
             cur = conn.cursor()
+            tid = current_tenant_id()
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_open_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_open_message' AND tenant_id = ?",
+                (tid,),
             )
             open_row = cur.fetchone()
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'auto_sms_closed_message'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'auto_sms_closed_message' AND tenant_id = ?",
+                (tid,),
             )
             closed_row = cur.fetchone()
             conn.close()
@@ -437,14 +470,26 @@ def send_auto_sms(phone_number, call_log_id=None):
 
 
 def delayed_auto_sms(phone_number, call_log_id, delay_seconds=45):
-    """Send auto-SMS after a delay (UPDATED: 45 seconds for missed calls)"""
+    """Send auto-SMS after a delay (UPDATED: 45 seconds for missed calls).
+
+    Captures the current tenant_id at call time (we're inside a Flask
+    request context here, so g.tenant_id was set by the Phase 3 webhook
+    router) and re-pins it inside the background thread so all the
+    db queries in send_auto_sms scope to the right tenant.
+    """
+    captured_tenant_id = current_tenant_id()
 
     def send_after_delay():
-        print(
-            f"⏰ Waiting {delay_seconds} seconds before sending auto-SMS to {phone_number}"
-        )
-        time.sleep(delay_seconds)
-        send_auto_sms(phone_number, call_log_id)
+        set_thread_tenant_id(captured_tenant_id)
+        try:
+            print(
+                f"⏰ Waiting {delay_seconds} seconds before sending auto-SMS "
+                f"to {phone_number} (tenant_id={captured_tenant_id})"
+            )
+            time.sleep(delay_seconds)
+            send_auto_sms(phone_number, call_log_id)
+        finally:
+            clear_thread_tenant_id()
 
     # Start background thread
     thread = threading.Thread(target=send_after_delay)
@@ -463,12 +508,13 @@ def log_call_to_db(call_data, user_id=None):
         cur.execute(
             """
             INSERT INTO call_log (
-                phone_number, direction, status, call_type, 
+                tenant_id, phone_number, direction, status, call_type,
                 caller_name, twilio_call_sid, timestamp, user_id
-            ) VALUES (?, 'inbound', ?, 'voice', ?, ?, ?, ?)
+            ) VALUES (?, ?, 'inbound', ?, 'voice', ?, ?, ?, ?)
             RETURNING id
         """,
             (
+                current_tenant_id(),
                 normalized_phone,
                 call_data["status"],
                 contact_name,
@@ -498,7 +544,9 @@ def log_call_to_db(call_data, user_id=None):
                 if socketio:
                     # Get current missed call count
                     cur.execute(
-                        "SELECT COUNT(*) as cnt FROM call_log WHERE status LIKE '%missed%'"
+                        "SELECT COUNT(*) as cnt FROM call_log "
+                        "WHERE status LIKE '%missed%' AND tenant_id = ?",
+                        (current_tenant_id(),),
                     )
                     row = cur.fetchone()
                     missed_count = row["cnt"] if row else 0
@@ -523,7 +571,9 @@ def get_dnd_status():
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'dnd_enabled'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'dnd_enabled' AND tenant_id = ?",
+            (current_tenant_id(),),
         )
         row = cur.fetchone()
         conn.close()
@@ -538,14 +588,21 @@ def get_active_greeting():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM greetings WHERE is_active = 1 LIMIT 1")
+        tid = current_tenant_id()
+        cur.execute(
+            "SELECT * FROM greetings WHERE is_active = 1 AND tenant_id = ? LIMIT 1",
+            (tid,),
+        )
         row = cur.fetchone()
         if row:
             conn.close()
             return dict(row)
         else:
             # Fallback to closed greeting if no active greeting found
-            cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+            cur.execute(
+                "SELECT * FROM greetings WHERE type = 'closed' AND tenant_id = ? LIMIT 1",
+                (tid,),
+            )
             row = cur.fetchone()
             conn.close()
             return dict(row) if row else None
@@ -562,7 +619,9 @@ def get_default_operator_identity():
 
         # Get default operator user_id from settings
         cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'default_operator_user_id'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'default_operator_user_id' AND tenant_id = ?",
+            (current_tenant_id(),),
         )
         setting_row = cur.fetchone()
         conn.close()
@@ -611,7 +670,9 @@ def incoming():
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT setting_value FROM app_settings WHERE setting_key = 'dnd_enabled'"
+            "SELECT setting_value FROM app_settings "
+            "WHERE setting_key = 'dnd_enabled' AND tenant_id = ?",
+            (current_tenant_id(),),
         )
         row = cur.fetchone()
         conn.close()
@@ -632,38 +693,36 @@ def incoming():
                 print("🔇 DND + Auto Mode (Open Hours)")
                 conn = get_db_connection()
                 cur = conn.cursor()
-                cur.execute("SELECT * FROM greetings WHERE type = 'open' LIMIT 1")
+                cur.execute(
+                    "SELECT * FROM greetings WHERE type = 'open' AND tenant_id = ? LIMIT 1",
+                    (current_tenant_id(),),
+                )
                 open_greeting = cur.fetchone()
                 conn.close()
 
                 greeting_audio_url = (
-                    open_greeting["audio_url"]
-                    if open_greeting
-                    else "https://softphone.pc-reps.com/new_open.mp3"
+                    open_greeting["audio_url"] if open_greeting else None
                 )
                 status = "missed_call_dnd_auto_open"
             else:
                 print("🔇 DND + Auto Mode (Closed Hours)")
                 conn = get_db_connection()
                 cur = conn.cursor()
-                cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+                cur.execute(
+                    "SELECT * FROM greetings WHERE type = 'closed' AND tenant_id = ? LIMIT 1",
+                    (current_tenant_id(),),
+                )
                 closed_greeting = cur.fetchone()
                 conn.close()
 
                 greeting_audio_url = (
-                    closed_greeting["audio_url"]
-                    if closed_greeting
-                    else "https://softphone.pc-reps.com/new_closed.mp3"
+                    closed_greeting["audio_url"] if closed_greeting else None
                 )
                 status = "missed_call_dnd_auto_closed"
         else:
             # Manual mode with DND - use the specific greeting
             greeting_audio_url = (
-                active_greeting.get(
-                    "audio_url", "https://softphone.pc-reps.com/new_closed.mp3"
-                )
-                if active_greeting
-                else "https://softphone.pc-reps.com/new_closed.mp3"
+                active_greeting.get("audio_url") if active_greeting else None
             )
             greeting_name = (
                 active_greeting.get("name", "Unknown") if active_greeting else "Unknown"
@@ -676,7 +735,7 @@ def incoming():
             print(f"🔇 DND + {greeting_name}")
 
         # Play greeting and go to voicemail (no dial attempt)
-        response.play(greeting_audio_url)
+        _play_or_say(response, greeting_audio_url)
         response.play("https://softphone.pc-reps.com/beep.mp3")
         response.record(
             max_length=60,
@@ -753,14 +812,15 @@ def incoming():
             # Use the "closed" greeting settings
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM greetings WHERE type = 'closed' LIMIT 1")
+            cur.execute(
+                "SELECT * FROM greetings WHERE type = 'closed' AND tenant_id = ? LIMIT 1",
+                (current_tenant_id(),),
+            )
             closed_greeting = cur.fetchone()
             conn.close()
 
             greeting_audio_url = (
-                closed_greeting["audio_url"]
-                if closed_greeting
-                else "https://softphone.pc-reps.com/new_closed.mp3"
+                closed_greeting["audio_url"] if closed_greeting else None
             )
 
             # Play greeting and go to voicemail
@@ -831,10 +891,9 @@ def incoming():
         greeting_name = "OPEN OVERRIDE (Call Routed)"
 
     else:
-        # CLOSED/MANUAL MODE: Use the specifically selected greeting (goes to voicemail)
-        greeting_audio_url = (
-            "https://softphone.pc-reps.com/new_closed.mp3"  # Default fallback
-        )
+        # CLOSED/MANUAL MODE: Use the specifically selected greeting (goes to voicemail).
+        # No hardcoded URL fallback here — _play_or_say below uses TTS when this is None.
+        greeting_audio_url = None
         greeting_name = "Unknown"
         status = "missed_call_manual_mode"
 
@@ -847,7 +906,7 @@ def incoming():
             print("⚠️ No active greeting found, using fallback")
 
         # Play greeting and go to voicemail for manual modes
-        response.play(greeting_audio_url)
+        _play_or_say(response, greeting_audio_url)
         response.play("https://softphone.pc-reps.com/beep.mp3")
         response.record(
             max_length=60,
@@ -901,7 +960,9 @@ def dial_status():
         user_id = None
         if status == "completed":
             cur.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'default_operator_user_id'"
+                "SELECT setting_value FROM app_settings "
+                "WHERE setting_key = 'default_operator_user_id' AND tenant_id = ?",
+                (current_tenant_id(),),
             )
             setting_row = cur.fetchone()
             if setting_row:
@@ -932,27 +993,20 @@ def dial_status():
             # Use open greeting for missed calls during open hours
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("SELECT * FROM greetings WHERE type = 'open' LIMIT 1")
+            cur.execute(
+                "SELECT * FROM greetings WHERE type = 'open' AND tenant_id = ? LIMIT 1",
+                (current_tenant_id(),),
+            )
             open_greeting = cur.fetchone()
             conn.close()
 
-            greeting_url = (
-                open_greeting["audio_url"]
-                if open_greeting
-                else "https://softphone.pc-reps.com/new_open.mp3"
-            )
+            greeting_url = open_greeting["audio_url"] if open_greeting else None
         else:
             # Use the active greeting for manual modes
-            greeting_url = (
-                active_greeting.get(
-                    "audio_url", "https://softphone.pc-reps.com/new_closed.mp3"
-                )
-                if active_greeting
-                else "https://softphone.pc-reps.com/new_closed.mp3"
-            )
+            greeting_url = active_greeting.get("audio_url") if active_greeting else None
 
         # Play voicemail greeting and record
-        response.play(greeting_url)
+        _play_or_say(response, greeting_url)
         response.play("https://softphone.pc-reps.com/beep.mp3")
         response.record(
             max_length=60,
@@ -1020,11 +1074,11 @@ def call_status():
                     cur.execute(
                         """
                         INSERT INTO call_log (
-                            phone_number, direction, status, call_type,
+                            tenant_id, phone_number, direction, status, call_type,
                             caller_name, twilio_call_sid, timestamp
-                        ) VALUES (?, 'inbound', 'completed', 'voice', ?, ?, ?)
+                        ) VALUES (?, ?, 'inbound', 'completed', 'voice', ?, ?, ?)
                     """,
-                        (normalized_phone, contact_name, call_sid, timestamp),
+                        (current_tenant_id(), normalized_phone, contact_name, call_sid, timestamp),
                     )
                     conn.commit()
                 conn.close()
@@ -1048,12 +1102,13 @@ def has_recent_conversation(phone_number, hours=720):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT COUNT(*) as cnt FROM messages 
-            WHERE phone_number = ? 
+            SELECT COUNT(*) as cnt FROM messages
+            WHERE phone_number = ?
             AND timestamp > ?
             AND is_auto_sms = 0
+            AND tenant_id = ?
         """,
-            (normalized_phone, cutoff_time),
+            (normalized_phone, cutoff_time, current_tenant_id()),
         )
 
         row = cur.fetchone()
