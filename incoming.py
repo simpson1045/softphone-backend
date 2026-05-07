@@ -47,8 +47,8 @@ def should_suppress_auto_sms(phone_number):
         if not normalized_phone:
             return False
 
-        # Check NovaCore for opt_out_sms
-        from novacore_contacts import find_customer_by_phone
+        # Check the tenant's contact source for opt_out_sms
+        from contact_provider import find_customer_by_phone
         customer = find_customer_by_phone(normalized_phone)
         if customer and customer.get("opted_out_sms"):
             return True

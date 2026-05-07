@@ -46,7 +46,20 @@ def notify_novacore_ticket(phone_number, direction, comm_type, body="", staff_us
     Fire-and-forget notification to NovaCore about an SMS/call event.
     Dispatched on a background thread so the caller's HTTP response
     is never blocked by NovaCore latency or downtime.
+
+    Tenant-guarded: NovaCore is PC Reps's shop ticketing system. For
+    HaniTech (and any non-novacore tenant), there's no NovaCore ticket
+    to update — skip cleanly. Captured here, before threading, since
+    the background thread has no Flask context.
     """
+    try:
+        from tenant_context import current_tenant
+        if current_tenant().get("contact_provider") != "novacore":
+            return
+    except Exception as e:
+        print(f"[NOVACORE-NOTIFY] tenant lookup failed, skipping: {e}", flush=True)
+        return
+
     api_key = os.getenv("EXTERNAL_SMS_API_KEY", "")
     if not api_key:
         print("[NOVACORE-NOTIFY] No API key configured, skipping", flush=True)
@@ -85,7 +98,21 @@ SOFTPHONE_API_KEY = os.getenv("SOFTPHONE_API_KEY", "")
 
 
 def _update_novacore_opt_out(phone_number, opt_out_sms):
-    """Update opt_out_sms on a NovaCore customer via the API."""
+    """Update opt_out_sms on a NovaCore customer via the API.
+
+    Tenant-guarded: only runs when the current tenant uses the novacore
+    contact provider (PC Reps). For HaniTech and any other native-tenant,
+    this is a no-op — those tenants have no NovaCore customer to update;
+    the local sms_preferences write elsewhere is the authoritative record.
+    """
+    from tenant_context import current_tenant
+    try:
+        if current_tenant().get("contact_provider") != "novacore":
+            return
+    except Exception as e:
+        print(f"⚠️ tenant lookup failed in _update_novacore_opt_out, skipping: {e}")
+        return
+
     from novacore_contacts import find_customer_by_phone
     try:
         customer = find_customer_by_phone(phone_number)
@@ -305,20 +332,20 @@ def send_closed_day_text_reply(phone_number):
             )
             return False
 
-        # Check if user has opted out (via sms_preferences table)
-        # Check NovaCore for opt_out_sms
-        from novacore_contacts import find_customer_by_phone
+        # Check if user has opted out, via the tenant-appropriate contact source
+        from contact_provider import find_customer_by_phone
         customer = find_customer_by_phone(normalized_phone)
         if customer and customer.get("opted_out_sms"):
-            print(f"🚫 Closed-day text suppressed for {normalized_phone} (NovaCore opt_out_sms)")
+            print(f"🚫 Closed-day text suppressed for {normalized_phone} (contact opt_out_sms)")
             return False
 
-        # Check local suppress_auto_sms flag
+        # Check local suppress_auto_sms flag (tenant-scoped)
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT suppress_auto_sms FROM sms_preferences WHERE phone_number = %s",
-            (normalized_phone,),
+            "SELECT suppress_auto_sms FROM sms_preferences "
+            "WHERE phone_number = %s AND tenant_id = %s",
+            (normalized_phone, current_tenant_id()),
         )
         pref = cur.fetchone()
         conn.close()
@@ -1238,14 +1265,14 @@ def search_messages():
 
 @messaging_bp.route("/contacts/search", methods=["GET"])
 def search_contacts():
-    """Search customers via NovaCore."""
+    """Search contacts via the current tenant's contact provider."""
     try:
-        from novacore_contacts import search_customers as nc_search
+        from contact_provider import search_customers as cp_search
         query = request.args.get("q", "").strip()
         if not query:
             return jsonify([])
 
-        results = nc_search(query)
+        results = cp_search(query)
         return jsonify(results)
 
     except Exception as e:
@@ -1255,9 +1282,10 @@ def search_contacts():
 
 @messaging_bp.route("/contacts/recent", methods=["GET"])
 def get_recent_contacts():
-    """Get recent contacts by looking up message threads against NovaCore."""
+    """Get recent contacts by looking up message threads against the
+    current tenant's contact provider."""
     try:
-        from novacore_contacts import find_customer_by_phone
+        from contact_provider import find_customer_by_phone
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1387,8 +1415,8 @@ def get_message_threads():
         rows = cur.fetchall()
         conn.close()
 
-        # Resolve all contact names from NovaCore in one query
-        from novacore_contacts import bulk_resolve_names
+        # Resolve all contact names via the tenant's contact provider in one query
+        from contact_provider import bulk_resolve_names
         phone_numbers = [row["phone_number"] for row in rows]
         name_map = bulk_resolve_names(phone_numbers)
 

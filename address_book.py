@@ -6,7 +6,9 @@ SMS preferences and flags are stored locally in the softphone database.
 
 from flask import Blueprint, request, jsonify
 from database import get_db_connection
-from novacore_contacts import fetch_all_customers, search_customers, _strip_to_digits
+# Dispatch through contact_provider so HaniTech doesn't see NovaCore customers.
+# _strip_to_digits is provider-agnostic and re-exported from novacore_contacts.
+from contact_provider import fetch_all_customers, search_customers, _strip_to_digits
 from tenant_context import current_tenant_id
 
 address_book_bp = Blueprint("address_book", __name__)

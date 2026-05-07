@@ -548,9 +548,9 @@ def log_outbound_call():
             print("❌ Invalid phone number")
             return jsonify({"error": "Invalid phone number"}), 400
 
-        # Get contact name from NovaCore
-        from novacore_contacts import get_contact_name as nc_get_name
-        contact_name = nc_get_name(normalized_phone)
+        # Get contact name via the current tenant's contact provider
+        from contact_provider import get_contact_name as cp_get_name
+        contact_name = cp_get_name(normalized_phone)
 
         conn = get_db_connection()  # still needed for call_log insert below
 
@@ -1951,8 +1951,16 @@ def novacore_lookup(phone_number):
 
     Returns the URL to the most recent open ticket if the customer has one,
     otherwise the customer profile URL. Returns 404 if no customer is found.
+
+    Tenant-guarded: NovaCore is PC Reps's shop ticketing system. For
+    HaniTech (or any non-novacore tenant), this endpoint has no meaningful
+    response — return 404 instead of leaking PC Reps customer data.
     """
     try:
+        from tenant_context import current_tenant
+        if current_tenant().get("contact_provider") != "novacore":
+            return jsonify({"error": "NovaCore lookup not available for this tenant"}), 404
+
         from urllib.parse import quote
 
         from novacore_contacts import find_customer_by_phone, get_novacore_connection
@@ -2306,7 +2314,7 @@ def lookup_contact(phone_number):
         if not normalized_phone:
             return jsonify({"error": "Invalid phone number"}), 400
 
-        from novacore_contacts import find_customer_by_phone
+        from contact_provider import find_customer_by_phone
         customer = find_customer_by_phone(normalized_phone)
 
         if customer:

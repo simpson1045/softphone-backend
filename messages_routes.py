@@ -4,7 +4,7 @@ import re
 import os
 from database import get_db_connection
 from phone_utils import normalize_phone_number, get_contact_name
-from novacore_contacts import bulk_resolve_names
+from contact_provider import bulk_resolve_names
 from tenant_context import current_tenant_id
 
 messages_api = Blueprint("messages_api", __name__)
