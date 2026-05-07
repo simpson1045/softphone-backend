@@ -574,7 +574,7 @@ def log_outbound_call():
                         contact_name,
                         call_sid,
                         datetime.now(timezone.utc).isoformat(),
-                        current_user.id if current_user.is_authenticated else None,
+                        current_user.numeric_id if current_user.is_authenticated else None,
                     ),
                 )
                 print(f"✅ Inserted new call record (SID: {call_sid})")
@@ -594,7 +594,7 @@ def log_outbound_call():
                     contact_name,
                     "",
                     datetime.now(timezone.utc).isoformat(),
-                    current_user.id if current_user.is_authenticated else None,
+                    current_user.numeric_id if current_user.is_authenticated else None,
                 ),
             )
             print("✅ Inserted new call record (no SID)")

@@ -756,7 +756,7 @@ def send_sms():
                 message_body,
                 media_urls,
                 message.sid,
-                user_id=current_user.id if current_user.is_authenticated else None,
+                user_id=current_user.numeric_id if current_user.is_authenticated else None,
             )
 
         else:
@@ -782,7 +782,7 @@ def send_sms():
                 message_body,
                 media_urls,
                 message.sid,
-                user_id=current_user.id if current_user.is_authenticated else None,
+                user_id=current_user.numeric_id if current_user.is_authenticated else None,
             )
 
         # Notify NovaCore once per logical message:
@@ -807,7 +807,7 @@ def send_sms():
                 "outbound",
                 "sms",
                 body=notify_body,
-                staff_user_id=current_user.id if current_user.is_authenticated else None,
+                staff_user_id=current_user.numeric_id if current_user.is_authenticated else None,
             )
 
         return jsonify(
