@@ -1,0 +1,47 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Twilio Client Debugger</title>
+  <script src="https://media.twiliocdn.com/sdk/js/voice/releases/2.0.0/twilio.min.js"></script>
+</head>
+<body style="font-family: sans-serif; background: #111; color: #eee; padding: 20px;">
+  <h1>📞 Twilio Client Debugger</h1>
+  <pre id="log" style="background: #222; padding: 10px; border-radius: 6px;"></pre>
+
+  <script>
+    const log = (msg) => {
+      const logElem = document.getElementById('log');
+      logElem.textContent += msg + '\n';
+      console.log(msg);
+    };
+
+    const init = async () => {
+      log("🔄 Requesting token...");
+      const res = await fetch("/voice/token");
+      const data = await res.json();
+
+      const device = new Twilio.Device(data.token, { debug: true });
+
+      device.on('registered', () => log("✅ Device registered"));
+      device.on('error', (err) => log("❌ Device error: " + err.message));
+      device.on('incoming', (conn) => {
+        log("📲 Incoming call from: " + conn.parameters.From);
+        conn.accept();
+      });
+      device.on('connect', () => log("🟢 Call connected"));
+      device.on('disconnect', () => log("🔴 Call disconnected"));
+
+      try {
+        await device.register();
+        log("📡 Registration requested...");
+      } catch (err) {
+        log("❌ Register failed: " + err.message);
+      }
+    };
+
+    init();
+  </script>
+</body>
+</html>

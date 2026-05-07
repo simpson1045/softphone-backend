@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@twilio/voice-sdk": "^2.13.0",
+    "react-router-dom": "^7.5.3"
+  }
+}
