@@ -27,7 +27,7 @@ from auth import auth_bp, init_login_manager
 from database import get_db_connection
 from call_recording import call_recording_bp
 from twilio_security import validate_twilio_request
-from tenant_context import current_tenant_id
+from tenant_context import current_tenant_id, tenant_by_phone
 
 import sys
 
@@ -182,6 +182,46 @@ def require_authentication():
             return jsonify({"error": "Authentication required"}), 401
 
     # Non-API paths (SPA routes, static files, Twilio voice webhooks) pass through
+    return None
+
+
+@app.before_request
+def resolve_tenant_from_webhook():
+    """Set g.tenant_id from the inbound `To` number on Twilio webhooks.
+
+    Twilio webhooks (POST /incoming, /dial-status, /messages/incoming, etc.)
+    don't have a logged-in user, so without this hook every webhook would
+    fall back to the pc_reps tenant via tenant_context.current_tenant_id().
+
+    Reading `To` from request.values lets us route HaniTech inbound traffic
+    (To = +17756185775) to the hanitech tenant and PC Reps inbound traffic
+    (To = +17754602190) to pc_reps. If `To` doesn't match any tenant or
+    isn't present, we leave g.tenant_id unset and the fallback chain in
+    tenant_context handles it (current_user.tenant_id, then pc_reps).
+    """
+    from flask import g
+
+    # Only Twilio POSTs include a "To" form field. Skip GETs and non-form requests fast.
+    if request.method != "POST":
+        return None
+
+    to_number = request.values.get("To") or request.form.get("To")
+    if not to_number:
+        return None
+
+    try:
+        tenant = tenant_by_phone(to_number)
+    except Exception as e:
+        print(f"⚠️ tenant lookup failed for To={to_number}: {e}")
+        return None
+
+    if tenant:
+        g.tenant_id = tenant["id"]
+        # Quiet log so we can audit routing without flooding (skip if it's the
+        # PC Reps default — that's the bulk of historical traffic and noisy).
+        if tenant["slug"] != "pc_reps":
+            print(f"🏢 Tenant routed: To={to_number} → {tenant['slug']}")
+
     return None
 
 
