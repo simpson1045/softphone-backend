@@ -1061,23 +1061,41 @@ def get_thread(phone_number):
         if not normalized_phone:
             return jsonify([])
 
-        # First, get all users from NovaCore (PostgreSQL) to build a lookup map
+        # Build user_map for per-message attribution (avatar color + name on hover).
+        # Source dispatches by tenant: PC Reps reads NovaCore.users (the legacy
+        # PC Reps employee table), HaniTech and any other native tenant reads
+        # softphone_users WHERE tenant_id = current. This avoids cross-table id
+        # collisions where e.g. NovaCore.id=1 (Mai) and softphone_users.id=1 (Matt)
+        # would otherwise both map a "user_id=1" message to NovaCore's row.
         user_map = {}
         try:
-            novacore_conn = get_novacore_connection()
-            novacore_cursor = novacore_conn.cursor()
-            novacore_cursor.execute(
-                "SELECT id, first_name, last_name, user_color FROM users"
-            )
-            for user_row in novacore_cursor.fetchall():
+            tid = current_tenant_id()
+            if current_tenant().get("contact_provider") == "novacore":
+                novacore_conn = get_novacore_connection()
+                novacore_cursor = novacore_conn.cursor()
+                novacore_cursor.execute(
+                    "SELECT id, first_name, last_name, user_color FROM users"
+                )
+                rows = novacore_cursor.fetchall()
+                novacore_conn.close()
+            else:
+                local_conn = get_db_connection()
+                local_cur = local_conn.cursor()
+                local_cur.execute(
+                    "SELECT id, first_name, last_name, user_color "
+                    "FROM softphone_users WHERE tenant_id = %s",
+                    (tid,),
+                )
+                rows = local_cur.fetchall()
+                local_conn.close()
+            for user_row in rows:
                 user_map[user_row["id"]] = {
                     "first_name": user_row["first_name"],
                     "last_name": user_row["last_name"],
                     "user_color": user_row["user_color"],
                 }
-            novacore_conn.close()
         except Exception as e:
-            print(f"⚠️ Error fetching users from NovaCore: {e}")
+            print(f"⚠️ Error building user_map for thread: {e}")
 
         conn = get_db_connection()
         cur = conn.cursor()
